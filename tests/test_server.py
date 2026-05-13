@@ -1,6 +1,21 @@
 import unittest
+import sys
+from pathlib import Path
 
-from server import ExportPayload, ValidationError, compile_graph, validate_model
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from server import ExportPayload, ValidationError, app, compile_graph, validate_model
+
+
+client = TestClient(app)
+
+
+def payload_dict(payload):
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump()
+    return payload.dict()
 
 
 def identity_payload(output_grid=None):
@@ -174,6 +189,24 @@ class ServerCompilerTests(unittest.TestCase):
             trainingPairs=[{"input": [[1]], "output": [[1]]}],
         )
         compile_graph(payload)
+
+    def test_compile_endpoint_reports_model_summary_without_upload(self):
+        response = client.post("/api/compile", json=payload_dict(identity_payload()))
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "compiled")
+        self.assertGreater(data["modelBytes"], 0)
+        self.assertEqual(data["io"]["inputs"][0]["shape"], [1, 1, 30, 30])
+        self.assertEqual(data["io"]["outputs"][0]["shape"], [1, 1, 30, 30])
+
+    def test_run_endpoint_runs_current_input_grid_without_upload(self):
+        payload = payload_dict(identity_payload())
+        payload["inputGrid"] = [[4, 5], [6, 7]]
+        response = client.post("/api/run", json=payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ran")
+        self.assertEqual(data["grid"], [[4, 5], [6, 7]])
 
 
 if __name__ == "__main__":

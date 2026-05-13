@@ -19,6 +19,7 @@ textarea { min-height: 72px; resize: vertical; font-family: ui-monospace, SFMono
 .btn:hover, .opGrid button:hover, .taskGrid button:hover { border-color: #14b8a6; color: #99f6e4; }
 .btn:disabled { cursor: not-allowed; opacity: .62; }
 .btn.primary { background: #0f766e; border-color: #14b8a6; color: #ecfeff; }
+.btn.activeMode { background: #1e293b; border-color: #38bdf8; color: #e0f2fe; }
 .btn.full { width: 100%; margin-top: 8px; }
 .btn.compact { min-width: 34px; padding: 6px; }
 .taskPicker { display: grid; grid-template-columns: 34px 1fr 34px; gap: 6px; }

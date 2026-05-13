@@ -159,7 +159,19 @@ function App() {
   const [isResizingExamples, setIsResizingExamples] = useState(false);
   const [quickOp, setQuickOp] = useState("Constant");
   const [selectedEdgeIds, setSelectedEdgeIds] = useState([]);
-  const example = currentTask?.train?.[0] || { input: [[0]], output: [[0]] };
+  const [exampleMode, setExampleMode] = useState("train");
+  const [exampleIndex, setExampleIndex] = useState(0);
+  const [runOutput, setRunOutput] = useState(null);
+  const exampleSets = useMemo(() => ({
+    train: currentTask?.train || [],
+    test: currentTask?.test || [],
+    extra: currentTask?.["arc-gen"] || [],
+  }), [currentTask]);
+  const visibleExamples = exampleSets[exampleMode] || [];
+  const example = visibleExamples[exampleIndex] || currentTask?.train?.[0] || { input: [[0]], output: [[0]] };
+  const expectedOutput = example.output || example.target || [[0]];
+  const displayedOutput = runOutput || expectedOutput;
+  const displayedOutputTitle = runOutput ? "RUN OUTPUT" : "OUTPUT";
   const trainingPairs = useMemo(() => currentTask?.train || [], [currentTask]);
   const stats = taskLoadState === "loaded"
     ? `${currentTask?.train?.length || 0} train, ${currentTask?.test?.length || 0} test, ${currentTask?.["arc-gen"]?.length || 0} extra`
@@ -187,6 +199,9 @@ function App() {
     setTaskLoadState("loading");
     setTaskLoadError("");
     setValidation({ state: "idle" });
+    setExampleMode("train");
+    setExampleIndex(0);
+    setRunOutput(null);
     fetch(`/tasks/${taskId}.json`, { cache: "no-cache" })
       .then((response) => {
         if (!response.ok) throw new Error(`${taskId}.json returned HTTP ${response.status}`);
@@ -256,6 +271,55 @@ function App() {
       const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
       setValidation({ state: "failed", taskId, reason });
       setStatus("Validation failed");
+    }
+  };
+
+  const selectExampleMode = (mode) => {
+    const examples = exampleSets[mode] || [];
+    const nextIndex = mode === exampleMode && examples.length > 0 ? (exampleIndex + 1) % examples.length : 0;
+    setExampleMode(mode);
+    setExampleIndex(nextIndex);
+    setRunOutput(null);
+    const label = mode === "extra" ? "extra" : mode;
+    setStatus(examples.length ? `${taskId} ${label} ${nextIndex + 1}/${examples.length}` : `${taskId} has no ${label} examples`);
+  };
+
+  const compileGraph = async () => {
+    setStatus("Compiling graph");
+    setRunOutput(null);
+    try {
+      const payload = { projectName, taskId, nodes, edges, trainingPairs };
+      const { data } = await axios.post("/api/compile", payload);
+      const outputShape = data.io?.outputs?.[0]?.shape?.join("x") || "unknown shape";
+      setStatus(`Compile passed: ${data.modelBytes} bytes, output ${outputShape}`);
+      setValidation((current) => current.state === "failed" ? { state: "idle" } : current);
+    } catch (error) {
+      const response = error.response?.data;
+      const rawReason = response?.reason || response?.detail?.reason || response?.detail || error.message;
+      const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
+      setValidation({ state: "failed", taskId, reason });
+      setStatus("Compile failed");
+    }
+  };
+
+  const runGraph = async () => {
+    if (!example?.input) {
+      setValidation({ state: "failed", taskId, reason: "Displayed example has no input grid to run" });
+      return;
+    }
+    setStatus("Running graph");
+    try {
+      const payload = { projectName, taskId, nodes, edges, trainingPairs, inputGrid: example.input };
+      const { data } = await axios.post("/api/run", payload);
+      setRunOutput(data.grid);
+      setStatus(`Run produced ${gridShape(data.grid)} output from ${exampleMode} ${exampleIndex + 1}`);
+      setValidation((current) => current.state === "failed" ? { state: "idle" } : current);
+    } catch (error) {
+      const response = error.response?.data;
+      const rawReason = response?.reason || response?.detail?.reason || response?.detail || error.message;
+      const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
+      setValidation({ state: "failed", taskId, reason });
+      setStatus("Run failed");
     }
   };
 
@@ -342,14 +406,18 @@ function App() {
         <nav className="topbar">
           <div><strong>Task {String(task).padStart(3, "0")}</strong><span>{stats}</span></div>
           <div className="actions">
-            {["Train", "Test", "Extra 10", "Compile", "Run"].map((label) => <button key={label} className="btn">{label === "Run" && <Play size={15} />}{label}</button>)}
+            <button className={`btn ${exampleMode === "train" ? "activeMode" : ""}`} onClick={() => selectExampleMode("train")}>Train</button>
+            <button className={`btn ${exampleMode === "test" ? "activeMode" : ""}`} onClick={() => selectExampleMode("test")}>Test</button>
+            <button className={`btn ${exampleMode === "extra" ? "activeMode" : ""}`} onClick={() => selectExampleMode("extra")}>Extra 10</button>
+            <button className="btn" onClick={compileGraph} disabled={taskLoadState !== "loaded"}>Compile</button>
+            <button className="btn" onClick={runGraph} disabled={taskLoadState !== "loaded"}><Play size={15} />Run</button>
             <button className="btn primary" onClick={exportOnnx} disabled={validation.state === "loading" || taskLoadState !== "loaded"}><Upload size={15} />Export ONNX</button>
           </div>
         </nav>
         <section className="examples">
           <div className="palette">{arcColors.map((color, index) => <span key={color}><i style={{ background: color }} />{index}</span>)}</div>
           <ArcGrid title="INPUT" values={example.input} />
-          <ArcGrid title="OUTPUT" values={example.output} />
+          <ArcGrid title={displayedOutputTitle} values={displayedOutput} />
         </section>
         <div
           className={`splitter ${isResizingExamples ? "active" : ""}`}

@@ -136,3 +136,28 @@ Changed source files:
 - `tests/test_server.py`
 
 Local/server `.env` was edited for runtime configuration and remains ignored. No secrets are recorded in this evaluation file.
+
+## Follow-up: Topbar Workflow Button Validation
+
+Date: 2026-05-13
+
+Issue found:
+
+- The visible `Train`, `Test`, `Extra 10`, `Compile`, and `Run` buttons were placeholders with no click handlers, so the actual GUI workflow could not switch examples, compile, or run the current graph from the topbar.
+
+Changes made:
+
+- Added frontend handlers for `Train`, `Test`, and `Extra 10`.
+- Added `/api/compile` to compile the current graph without validating against training pairs or pushing artifacts.
+- Added `/api/run` to compile the current graph, run it against the currently displayed input grid, and return a preview grid without pushing artifacts.
+- Wired `Compile` and `Run` buttons to those backend endpoints.
+- Added focused backend tests for `/api/compile` and `/api/run`.
+
+Verification:
+
+- `pytest -q` passed: 12 tests and 5 subtests.
+- `cd client && npm run build` passed.
+- Live app `GET http://127.0.0.1:8081/` returned 200 after restart.
+- Live task JSON `GET http://127.0.0.1:8081/tasks/task010.json` returned 200.
+- Browser workflow validation clicked `Train`, `Test`, `Extra 10`, `Compile`, and `Run`; `Compile` reported success and `Run` displayed `RUN OUTPUT`.
+- Browser workflow validation also added a `Constant` node through the quick-add UI and deleted it with the keyboard `Delete` key.

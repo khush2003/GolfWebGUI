@@ -99,6 +99,10 @@ class ExportPayload(BaseModel):
     trainingPairs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class RunPayload(ExportPayload):
+    inputGrid: Any | None = None
+
+
 class ValidationError(Exception):
     pass
 
@@ -646,6 +650,30 @@ def save_model(model: onnx.ModelProto, payload: ExportPayload) -> Path:
     return out_path
 
 
+def _dim_value(dim: onnx.TensorShapeProto.Dimension) -> int | str | None:
+    if dim.HasField("dim_value"):
+        return int(dim.dim_value)
+    if dim.HasField("dim_param"):
+        return dim.dim_param
+    return None
+
+
+def _value_info_summary(value_info: onnx.ValueInfoProto) -> dict[str, Any]:
+    tensor_type = value_info.type.tensor_type
+    return {
+        "name": value_info.name,
+        "elemType": int(tensor_type.elem_type),
+        "shape": [_dim_value(dim) for dim in tensor_type.shape.dim],
+    }
+
+
+def _model_summary(model: onnx.ModelProto) -> dict[str, Any]:
+    return {
+        "inputs": [_value_info_summary(item) for item in model.graph.input],
+        "outputs": [_value_info_summary(item) for item in model.graph.output],
+    }
+
+
 def _arc_grid_to_canvas(value: Any) -> tuple[np.ndarray, tuple[int, int]]:
     arr = np.asarray(value, dtype=np.float32)
     if arr.ndim == 2:
@@ -700,6 +728,23 @@ def _run_session(session: ort.InferenceSession, source_grid: Any) -> tuple[np.nd
     return session.run(None, feed)[0], region
 
 
+def _tensor_to_grid(tensor: np.ndarray, region: tuple[int, int]) -> list[list[int | float | bool]]:
+    array = np.asarray(tensor)
+    if array.ndim >= 4:
+        array = array[0, 0]
+    elif array.ndim == 3:
+        array = array[0]
+    elif array.ndim == 1:
+        array = array.reshape(1, -1)
+    height, width = region
+    if array.ndim == 2:
+        array = array[:height, :width]
+    rounded = np.rint(array)
+    if np.all(np.isfinite(array)) and np.all(array == rounded):
+        return rounded.astype(int).tolist()
+    return array.tolist()
+
+
 def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, str]:
     if not payload.trainingPairs:
         raise ValidationError("Phase 1 Strict Equivalence failed: no ARC training pairs were supplied")
@@ -748,6 +793,49 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
         _assert_color_bounds(f"Canvas Train {index}", tensor)
 
     return {"train": "passed", "shape": "passed", "colors": "passed"}
+
+
+@app.post("/api/compile")
+def compile_onnx(payload: ExportPayload):
+    try:
+        model = compile_graph(payload)
+        return {
+            "status": "compiled",
+            "taskId": _task_id(payload),
+            "modelBytes": len(model.SerializeToString()),
+            "nodeCount": len(payload.nodes),
+            "edgeCount": len(payload.edges),
+            "io": _model_summary(model),
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"status": "failed", "reason": str(exc)})
+
+
+@app.post("/api/run")
+def run_onnx(payload: RunPayload):
+    try:
+        model = compile_graph(payload)
+        source_grid = payload.inputGrid
+        if source_grid is None:
+            if not payload.trainingPairs:
+                raise ValueError("Run requires inputGrid or at least one training pair")
+            source_grid = payload.trainingPairs[0].get("input")
+        if source_grid is None:
+            raise ValueError("Run input grid is missing")
+        session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+        actual, region = _run_session(session, source_grid)
+        _assert_color_bounds("Run", actual)
+        return {
+            "status": "ran",
+            "taskId": _task_id(payload),
+            "shape": list(actual.shape),
+            "grid": _tensor_to_grid(actual, region),
+            "io": _model_summary(model),
+        }
+    except ValidationError as exc:
+        return JSONResponse(status_code=400, content={"status": "failed", "reason": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"status": "failed", "reason": str(exc)})
 
 
 @app.post("/api/export")
