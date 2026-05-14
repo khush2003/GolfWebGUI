@@ -7,7 +7,7 @@ import "reactflow/dist/style.css";
 import "./style.css";
 
 const arcColors = ["#000000", "#0074D9", "#FF4136", "#2ECC40", "#FFDC00", "#AAAAAA", "#F012BE", "#FF851B", "#7FDBFF", "#870C25"];
-const ops = ["Input", "Output", "Constant", "RowIndex", "ColIndex", "Cast", "Identity", "Equal", "Greater", "Less", "Not", "And", "Add", "Sub", "Mul", "Div", "ReduceSum", "ArgMax", "Where", "Slice", "Pad", "Concat", "Transpose", "Tile", "Resize", "Conv"];
+const baseOps = ["Input", "Output", "Constant", "RowIndex", "ColIndex", "Cast", "Identity", "Equal", "Greater", "Less", "GreaterOrEqual", "LessOrEqual", "Not", "And", "Or", "Xor", "Add", "Sub", "Mul", "Div", "Mod", "Min", "Max", "Sum", "Relu", "Abs", "Neg", "Floor", "Clip", "Sign", "Sqrt", "ReduceSum", "ReduceMax", "ReduceMin", "ArgMax", "Where", "Slice", "Pad", "Concat", "Transpose", "Tile", "Resize", "Conv"];
 const PROJECT_STORAGE_KEY = "neurogolf-projects-v1";
 const TASK_COUNT = 400;
 const TASK_PAGE_SIZE = 40;
@@ -27,11 +27,28 @@ const inputSlots = {
   Equal: ["a", "b"],
   Greater: ["a", "b"],
   Less: ["a", "b"],
+  GreaterOrEqual: ["a", "b"],
+  LessOrEqual: ["a", "b"],
   And: ["a", "b"],
+  Or: ["a", "b"],
+  Xor: ["a", "b"],
   Add: ["a", "b"],
   Sub: ["a", "b"],
   Mul: ["a", "b"],
   Div: ["a", "b"],
+  Mod: ["a", "b"],
+  Min: ["a", "b"],
+  Max: ["a", "b"],
+  Sum: ["a", "b"],
+  Relu: ["input"],
+  Abs: ["input"],
+  Neg: ["input"],
+  Floor: ["input"],
+  Clip: ["input"],
+  Sign: ["input"],
+  Sqrt: ["input"],
+  ReduceMax: ["input"],
+  ReduceMin: ["input"],
   Where: ["condition", "true", "false"],
   Concat: ["a", "b"],
 };
@@ -39,7 +56,10 @@ const inputSlots = {
 function defaultAttrs(opType) {
   if (opType === "Cast") return { to: "1" };
   if (opType === "ReduceSum") return { axes: [2, 3], keepdims: 1 };
+  if (opType === "ReduceMax") return { axes: [2, 3], keepdims: 1 };
+  if (opType === "ReduceMin") return { axes: [2, 3], keepdims: 1 };
   if (opType === "ArgMax") return { axis: 1, keepdims: 1 };
+  if (opType === "Clip") return { min: 0, max: 9 };
   if (opType === "Slice") return { starts: [0, 0, 0, 0], ends: [1, 1, 30, 30], axes: [0, 1, 2, 3], steps: [1, 1, 1, 1] };
   if (opType === "Pad") return { pads: [0, 0, 0, 0, 0, 0, 0, 0], value: 0 };
   if (opType === "Concat") return { axis: 1 };
@@ -48,6 +68,13 @@ function defaultAttrs(opType) {
   if (opType === "Resize") return { sizes: [1, 1, 30, 30], mode: "nearest" };
   if (opType === "Conv") return { weight_shape: [1, 1, 3, 3], weights: [1, 1, 1, 1, 1, 1, 1, 1, 1], pads: [1, 1, 1, 1], strides: [1, 1] };
   return {};
+}
+
+function slotsForOp(opType, opInputs = {}) {
+  if (inputSlots[opType]) return inputSlots[opType];
+  if (opType === "Input" || opType === "Constant") return [];
+  const count = opInputs[opType] || 1;
+  return Array.from({ length: count }, (_, index) => `in${index}`);
 }
 
 function clampTask(value) {
@@ -142,7 +169,7 @@ function persistStoredProjects(projects) {
 }
 
 function OpNode({ data, selected }) {
-  const slots = inputSlots[data.opType] || [];
+  const slots = data.inputSlots || inputSlots[data.opType] || [];
   return (
     <div className={`node ${selected ? "nodeSelected" : ""}`}>
       {slots.map((slot, index) => (
@@ -166,6 +193,57 @@ const nodeTypes = { op: OpNode };
 
 function gridShape(grid) {
   return `${grid?.length || 0}x${grid?.[0]?.length || 0}`;
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value)) return "";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function nowLabel() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function buildExportPayload({ projectName, taskId, nodes, edges, trainingPairs }) {
+  return {
+    projectName,
+    taskId,
+    nodes,
+    edges,
+    trainingPairs,
+  };
+}
+
+function validatePayload(payload) {
+  const checks = [];
+  const nodeIds = new Set();
+  const duplicateIds = new Set();
+  for (const node of payload.nodes) {
+    if (nodeIds.has(node.id)) duplicateIds.add(node.id);
+    nodeIds.add(node.id);
+  }
+  const edgeErrors = payload.edges.filter((edge) => !nodeIds.has(edge.source) || !nodeIds.has(edge.target));
+  const inputNodes = payload.nodes.filter((node) => node.data?.opType === "Input");
+  const outputNodes = payload.nodes.filter((node) => node.data?.opType === "Output");
+  const connectedOutputs = outputNodes.filter((node) => payload.edges.some((edge) => edge.target === node.id));
+  const unknownOps = payload.nodes.filter((node) => !node.data?.opType);
+
+  checks.push({ label: "Project name", ok: Boolean(payload.projectName?.trim()), detail: payload.projectName || "missing" });
+  checks.push({ label: "Task id", ok: /^task\d{3}$/.test(payload.taskId), detail: payload.taskId });
+  checks.push({ label: "Nodes", ok: payload.nodes.length > 0, detail: `${payload.nodes.length}` });
+  checks.push({ label: "Edges", ok: edgeErrors.length === 0, detail: edgeErrors.length ? `${edgeErrors.length} malformed` : `${payload.edges.length}` });
+  checks.push({ label: "Input node", ok: inputNodes.length > 0, detail: `${inputNodes.length}` });
+  checks.push({ label: "Connected output", ok: connectedOutputs.length > 0, detail: `${connectedOutputs.length}/${outputNodes.length}` });
+  checks.push({ label: "Training pairs", ok: payload.trainingPairs.length > 0, detail: `${payload.trainingPairs.length}` });
+  checks.push({ label: "Duplicate ids", ok: duplicateIds.size === 0, detail: duplicateIds.size ? Array.from(duplicateIds).join(", ") : "none" });
+  checks.push({ label: "Op labels", ok: unknownOps.length === 0, detail: unknownOps.length ? `${unknownOps.length} missing` : "ready" });
+
+  return {
+    ok: checks.every((check) => check.ok),
+    checks,
+  };
 }
 
 function ArcGrid({ title, values }) {
@@ -227,10 +305,62 @@ function ValidationPanel({ validation, taskId }) {
   );
 }
 
+function ExportInspector({ payload, payloadJson, payloadValidation, selectedNode, selectedEdges, lastRun, lastExport, lastDownload }) {
+  const selectedEdge = selectedEdges[0];
+  const selectedLabel = selectedNode
+    ? `${selectedNode.id} / ${selectedNode.data?.opType || "Unknown"}`
+    : selectedEdge
+      ? `${selectedEdge.source} -> ${selectedEdge.target}${selectedEdge.targetHandle ? `.${selectedEdge.targetHandle}` : ""}`
+      : "none";
+  const lastRunLabel = lastRun.state === "idle"
+    ? "not run"
+    : `${lastRun.state}${lastRun.shape ? ` / ${lastRun.shape}` : ""}${lastRun.reason ? ` / ${lastRun.reason}` : ""}`;
+  const lastExportLabel = lastExport.state === "idle"
+    ? "not exported"
+    : `${lastExport.state}${lastExport.artifact ? ` / ${lastExport.artifact}` : ""}${lastExport.reason ? ` / ${lastExport.reason}` : ""}`;
+  const lastDownloadLabel = lastDownload.state === "idle"
+    ? "not downloaded"
+    : `${lastDownload.name} / ${lastDownload.at}`;
+
+  return (
+    <section className="payloadInspector" aria-label="Export payload inspector">
+      <h2>EXPORT PAYLOAD</h2>
+      <div className="payloadGrid">
+        <div><span>Project</span><strong>{payload.projectName}</strong></div>
+        <div><span>Task</span><strong>{payload.taskId}</strong></div>
+        <div><span>Nodes</span><strong data-testid="payload-node-count">{payload.nodes.length}</strong></div>
+        <div><span>Edges</span><strong data-testid="payload-edge-count">{payload.edges.length}</strong></div>
+        <div><span>Train</span><strong>{payload.trainingPairs.length}</strong></div>
+        <div><span>Selected</span><strong data-testid="payload-selected">{selectedLabel}</strong></div>
+      </div>
+      <div className="payloadChecks">
+        {payloadValidation.checks.map((check) => (
+          <div key={check.label} className={check.ok ? "payloadCheck ok" : "payloadCheck bad"}>
+            <span>{check.ok ? "OK" : "ERR"}</span>
+            <strong>{check.label}</strong>
+            <em>{check.detail}</em>
+          </div>
+        ))}
+      </div>
+      <div className="payloadEvents">
+        <div><span>Last run</span><strong data-testid="payload-last-run">{lastRunLabel}</strong></div>
+        <div><span>Last export</span><strong data-testid="payload-last-export">{lastExportLabel}</strong></div>
+        <div><span>Last download</span><strong data-testid="payload-last-download">{lastDownloadLabel}</strong></div>
+      </div>
+      <details className="payloadJson">
+        <summary>Payload JSON</summary>
+        <pre>{payloadJson}</pre>
+      </details>
+    </section>
+  );
+}
+
 function App() {
   const [task, setTask] = useState(10);
   const [projectName, setProjectName] = useState("neurogolf-task010");
   const [storedProjects, setStoredProjects] = useState(() => loadStoredProjects());
+  const [bestManifest, setBestManifest] = useState(null);
+  const [bestLoadState, setBestLoadState] = useState("loading");
   const [selectedProjectName, setSelectedProjectName] = useState("baseline-cast-equal");
   const [selectedId, setSelectedId] = useState(null);
   const [status, setStatus] = useState("Ready");
@@ -242,9 +372,13 @@ function App() {
   const [isResizingExamples, setIsResizingExamples] = useState(false);
   const [quickOp, setQuickOp] = useState("Constant");
   const [selectedEdgeIds, setSelectedEdgeIds] = useState([]);
+  const [reactFlowInstance, setReactFlowInstance] = useState(null);
   const [exampleMode, setExampleMode] = useState("train");
   const [exampleIndex, setExampleIndex] = useState(0);
   const [runOutput, setRunOutput] = useState(null);
+  const [lastRun, setLastRun] = useState({ state: "idle" });
+  const [lastExport, setLastExport] = useState({ state: "idle" });
+  const [lastDownload, setLastDownload] = useState({ state: "idle" });
   const exampleSets = useMemo(() => ({
     train: currentTask?.train || [],
     test: currentTask?.test || [],
@@ -273,6 +407,21 @@ function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState(defaultEdges());
   const selectedNode = nodes.find((node) => node.id === selectedId);
   const selectedEdges = edges.filter((edge) => selectedEdgeIds.includes(edge.id));
+  const exportPayload = useMemo(
+    () => buildExportPayload({ projectName, taskId, nodes, edges, trainingPairs }),
+    [projectName, taskId, nodes, edges, trainingPairs]
+  );
+  const payloadValidation = useMemo(() => validatePayload(exportPayload), [exportPayload]);
+  const payloadPreview = useMemo(() => JSON.stringify(exportPayload, null, 2), [exportPayload]);
+  const opInputs = bestManifest?.opInputs || {};
+  const availableOps = useMemo(
+    () => Array.from(new Set([...baseOps, ...(bestManifest?.opTypes || [])])).sort((a, b) => a.localeCompare(b)),
+    [bestManifest]
+  );
+  const bestTask = useMemo(
+    () => bestManifest?.tasks?.find((item) => item.taskId === taskId),
+    [bestManifest, taskId]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -282,6 +431,8 @@ function App() {
     setExampleMode("train");
     setExampleIndex(0);
     setRunOutput(null);
+    setLastRun({ state: "idle" });
+    setLastExport({ state: "idle" });
     fetch(`/tasks/${taskId}.json`, { cache: "no-cache" })
       .then((response) => {
         if (!response.ok) throw new Error(`${taskId}.json returned HTTP ${response.status}`);
@@ -305,10 +456,38 @@ function App() {
     };
   }, [taskId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/best/manifest.json", { cache: "no-cache" })
+      .then((response) => {
+        if (!response.ok) throw new Error(`best manifest returned HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setBestManifest(data);
+        setBestLoadState("loaded");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBestManifest(null);
+        setBestLoadState("failed");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const scheduleFitView = () => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => reactFlowInstance?.fitView({ padding: 0.2 }));
+    });
+  };
+
   const addNode = (opType) => {
     const count = nodes.filter((node) => node.data?.opType === opType).length + 1;
     const id = `${opType.toLowerCase()}_${count}`;
-    const data = { label: id, opType, shape: "1,1,30,30", attrs: defaultAttrs(opType) };
+    const data = { label: id, opType, shape: "1,1,30,30", attrs: defaultAttrs(opType), inputSlots: slotsForOp(opType, opInputs) };
     if (opType === "Constant") data.value = "0";
     setNodes((current) => [...current, { id, type: "op", position: { x: 160 + current.length * 28, y: 190 }, data }]);
     setSelectedId(id);
@@ -320,6 +499,8 @@ function App() {
     setSelectedEdgeIds([]);
     setRunOutput(null);
     setValidation({ state: "idle" });
+    setLastRun({ state: "idle" });
+    setLastExport({ state: "idle" });
   };
 
   const newProject = () => {
@@ -329,6 +510,7 @@ function App() {
     setEdges(cloneGraph(defaultEdges()));
     resetTransientGraphState();
     setStatus(`New project ${name}`);
+    scheduleFitView();
   };
 
   const saveProject = () => {
@@ -366,6 +548,28 @@ function App() {
     setEdges(cloneGraph(project.edges));
     resetTransientGraphState();
     setStatus(`Loaded project ${project.name}`);
+    scheduleFitView();
+  };
+
+  const loadBestGraph = async () => {
+    if (!bestTask) {
+      setStatus(`No best ONNX graph for ${taskId}`);
+      return;
+    }
+    setStatus(`Loading best ONNX graph for ${taskId}`);
+    try {
+      const { data } = await axios.get(`/api/best-graph/${taskId}`);
+      setProjectName(data.projectName || `best-${taskId}-onnx`);
+      setNodes(cloneGraph(data.nodes || []));
+      setEdges(cloneGraph(data.edges || []));
+      resetTransientGraphState();
+      setStatus(`Loaded best ONNX graph: ${data.meta?.nodeCount || 0} raw nodes`);
+      scheduleFitView();
+    } catch (error) {
+      const response = error.response?.data;
+      const rawReason = response?.reason || response?.detail || error.message;
+      setStatus(`Best graph load failed: ${typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason)}`);
+    }
   };
 
   const updateSelected = (patch) => {
@@ -389,20 +593,23 @@ function App() {
   const exportOnnx = async () => {
     if (taskLoadState !== "loaded" || trainingPairs.length === 0) {
       setValidation({ state: "failed", taskId, reason: taskLoadError || "Selected task has no loaded training pairs" });
+      setLastExport({ state: "failed", taskId, reason: taskLoadError || "Selected task has no loaded training pairs", at: nowLabel() });
       return;
     }
     setStatus("Exporting ONNX");
     setValidation({ state: "loading", taskId });
+    setLastExport({ state: "loading", taskId, at: nowLabel() });
     try {
-      const payload = { projectName, taskId, nodes, edges, trainingPairs };
-      const { data } = await axios.post("/api/export", payload);
+      const { data } = await axios.post("/api/export", exportPayload);
       setValidation({ state: "passed", taskId, artifact: data.artifact });
+      setLastExport({ state: "passed", taskId, artifact: data.artifact, at: nowLabel() });
       setStatus(`Validation passed. Exported ${data.artifact}`);
     } catch (error) {
       const response = error.response?.data;
       const rawReason = response?.reason || response?.detail?.reason || response?.detail || error.message;
       const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
       setValidation({ state: "failed", taskId, reason });
+      setLastExport({ state: "failed", taskId, reason, at: nowLabel() });
       setStatus("Validation failed");
     }
   };
@@ -421,8 +628,7 @@ function App() {
     setStatus("Compiling graph");
     setRunOutput(null);
     try {
-      const payload = { projectName, taskId, nodes, edges, trainingPairs };
-      const { data } = await axios.post("/api/compile", payload);
+      const { data } = await axios.post("/api/compile", exportPayload);
       const outputShape = data.io?.outputs?.[0]?.shape?.join("x") || "unknown shape";
       setStatus(`Compile passed: ${data.modelBytes} bytes, output ${outputShape}`);
       setValidation((current) => current.state === "failed" ? { state: "idle" } : current);
@@ -438,13 +644,16 @@ function App() {
   const runGraph = async () => {
     if (!example?.input) {
       setValidation({ state: "failed", taskId, reason: "Displayed example has no input grid to run" });
+      setLastRun({ state: "failed", taskId, reason: "Displayed example has no input grid to run", at: nowLabel() });
       return;
     }
     setStatus("Running graph");
+    setLastRun({ state: "loading", taskId, example: `${exampleMode} ${exampleIndex + 1}`, at: nowLabel() });
     try {
-      const payload = { projectName, taskId, nodes, edges, trainingPairs, inputGrid: example.input };
+      const payload = { ...exportPayload, inputGrid: example.input };
       const { data } = await axios.post("/api/run", payload);
       setRunOutput(data.grid);
+      setLastRun({ state: "passed", taskId, shape: gridShape(data.grid), example: `${exampleMode} ${exampleIndex + 1}`, at: nowLabel() });
       setStatus(`Run produced ${gridShape(data.grid)} output from ${exampleMode} ${exampleIndex + 1}`);
       setValidation((current) => current.state === "failed" ? { state: "idle" } : current);
     } catch (error) {
@@ -452,14 +661,14 @@ function App() {
       const rawReason = response?.reason || response?.detail?.reason || response?.detail || error.message;
       const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
       setValidation({ state: "failed", taskId, reason });
+      setLastRun({ state: "failed", taskId, reason, example: `${exampleMode} ${exampleIndex + 1}`, at: nowLabel() });
       setStatus("Run failed");
     }
   };
 
-  const payloadPreview = useMemo(
-    () => JSON.stringify({ projectName, taskId, nodes, edges, trainingPairs }, null, 2),
-    [projectName, taskId, nodes, edges, trainingPairs]
-  );
+  const recordDownload = (name, path) => {
+    setLastDownload({ state: "downloaded", name, path, taskId, at: nowLabel() });
+  };
 
   const onConnect = useCallback((params) => setEdges((eds) => addEdge({ ...params, id: `${params.source}-${params.target}-${params.targetHandle || "input"}-${eds.length + 1}` }, eds)), [setEdges]);
 
@@ -527,14 +736,37 @@ function App() {
           <button className="btn full" onClick={loadProject} disabled={availableProjects.length === 0}>Load Selected</button>
         </section>
         <section>
+          <h2>BEST TEMPLATE</h2>
+          {bestLoadState === "loaded" && bestManifest ? (
+            <div className="bestTemplate">
+              <div className="muted">{bestManifest.fileCount} ONNX files from current best submission</div>
+              {bestTask ? (
+                <>
+                  <button className="btn full" onClick={loadBestGraph}>Load Graph</button>
+                  <a className="btn full btnLink" href={bestTask.path} download onClick={() => recordDownload(`${taskId}.onnx`, bestTask.path)}>
+                    Task {String(task).padStart(3, "0")} ONNX
+                  </a>
+                </>
+              ) : (
+                <div className="muted">No ONNX file for {taskId}</div>
+              )}
+              <a className="btn full btnLink" href={bestManifest.zipPath} download onClick={() => recordDownload(bestManifest.zipName || "submission-best.zip", bestManifest.zipPath)}>
+                Full best zip {formatBytes(bestManifest.zipSize)}
+              </a>
+            </div>
+          ) : (
+            <div className="muted">{bestLoadState === "failed" ? "Best template unavailable" : "Loading best template"}</div>
+          )}
+        </section>
+        <section>
           <h2>ADD NODE</h2>
           <div className="quickAdd">
             <select value={quickOp} onChange={(event) => setQuickOp(event.target.value)}>
-              {ops.map((op) => <option key={op}>{op}</option>)}
+              {availableOps.map((op) => <option key={op}>{op}</option>)}
             </select>
             <button className="btn" onClick={() => addNode(quickOp)}><Plus size={14} />Add</button>
           </div>
-          <div className="opGrid">{ops.map((op) => <button key={op} onClick={() => addNode(op)}><Plus size={14} />{op}</button>)}</div>
+          <div className="opGrid">{availableOps.map((op) => <button key={op} onClick={() => addNode(op)}><Plus size={14} />{op}</button>)}</div>
         </section>
       </aside>
       <main className="workspace" style={{ "--example-height": `${exampleHeight}px` }}>
@@ -581,6 +813,7 @@ function App() {
               setSelectedId(null);
               setSelectedEdgeIds([edge.id]);
             }}
+            onInit={setReactFlowInstance}
             fitView
           >
             <Background gap={18} size={1} color="#cbd5e1" />
@@ -609,10 +842,16 @@ function App() {
             <button className="danger" onClick={deleteSelected}><Trash2 size={15} />Delete Edge</button>
           </div>
         ) : <p className="muted">Select a node or edge to inspect graph bindings and ONNX attributes.</p>}
-        <section>
-          <h2>EXPORT PAYLOAD</h2>
-          <textarea className="payloadPreview" value={payloadPreview} readOnly />
-        </section>
+        <ExportInspector
+          payload={exportPayload}
+          payloadJson={payloadPreview}
+          payloadValidation={payloadValidation}
+          selectedNode={selectedNode}
+          selectedEdges={selectedEdges}
+          lastRun={lastRun}
+          lastExport={lastExport}
+          lastDownload={lastDownload}
+        />
         <div className="status">{status}</div>
       </aside>
     </div>

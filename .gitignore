@@ -16,9 +16,16 @@ client/playwright-report/
 *.log
 *.tar.gz
 *.zip
+*.onnx
 tmp*/
 temp*/
 
 cloudflared.log
 server.log
+
+client/dist/best/
+client/public/best/manifest.json
+client/public/best/onnx/
+!client/public/best/
+!client/public/best/README.md
 jupyter-8080.log

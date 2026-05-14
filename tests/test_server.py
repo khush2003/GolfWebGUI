@@ -82,6 +82,25 @@ def single_op_payload(op_type, attrs=None, output_grid=None):
     )
 
 
+def binary_op_payload(op_type, attrs=None):
+    return ExportPayload(
+        projectName=f"test-{op_type.lower()}",
+        taskId="task001",
+        nodes=[
+            {"id": "input_1", "type": "op", "data": {"opType": "Input", "shape": "1,1,30,30"}},
+            {"id": "const_1", "type": "op", "data": {"opType": "Constant", "shape": "1,1,30,30", "value": "1"}},
+            {"id": "op_1", "type": "op", "data": {"opType": op_type, "shape": "1,1,30,30", "attrs": attrs or {}}},
+            {"id": "output_1", "type": "op", "data": {"opType": "Output", "shape": "1,1,30,30"}},
+        ],
+        edges=[
+            {"source": "input_1", "target": "op_1", "targetHandle": "a"},
+            {"source": "const_1", "target": "op_1", "targetHandle": "b"},
+            {"source": "op_1", "target": "output_1", "targetHandle": "input"},
+        ],
+        trainingPairs=[{"input": [[1]], "output": [[1]]}],
+    )
+
+
 class ServerCompilerTests(unittest.TestCase):
     def test_compile_and_validate_identity_graph(self):
         payload = identity_payload()
@@ -190,6 +209,38 @@ class ServerCompilerTests(unittest.TestCase):
         )
         compile_graph(payload)
 
+    def test_compile_low_risk_extended_ops(self):
+        cases = [
+            single_op_payload("Relu"),
+            single_op_payload("Abs"),
+            single_op_payload("Neg"),
+            single_op_payload("Floor"),
+            single_op_payload("Clip", attrs={"min": 0, "max": 9}),
+            single_op_payload("Sign"),
+            single_op_payload("Sqrt"),
+            single_op_payload("ReduceMax", attrs={"axes": [1], "keepdims": 1}),
+            single_op_payload("ReduceMin", attrs={"axes": [1], "keepdims": 1}),
+            binary_op_payload("GreaterOrEqual"),
+            binary_op_payload("LessOrEqual"),
+            binary_op_payload("Add"),
+            binary_op_payload("Sub"),
+            binary_op_payload("Mul"),
+            binary_op_payload("Div"),
+            binary_op_payload("Mod"),
+            binary_op_payload("Min"),
+            binary_op_payload("Max"),
+            binary_op_payload("Sum"),
+        ]
+        for payload in cases:
+            with self.subTest(op=payload.nodes[-2]["data"]["opType"]):
+                compile_graph(payload)
+
+    def test_generic_in_numbered_slots_order_inputs(self):
+        payload = binary_op_payload("Add")
+        payload.edges[0]["targetHandle"] = "in0"
+        payload.edges[1]["targetHandle"] = "in1"
+        compile_graph(payload)
+
     def test_compile_endpoint_reports_model_summary_without_upload(self):
         response = client.post("/api/compile", json=payload_dict(identity_payload()))
         self.assertEqual(response.status_code, 200)
@@ -207,6 +258,19 @@ class ServerCompilerTests(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["status"], "ran")
         self.assertEqual(data["grid"], [[4, 5], [6, 7]])
+
+    def test_best_graph_endpoint_imports_onnx_as_visual_nodes(self):
+        best_path = Path(__file__).resolve().parents[1] / "client" / "public" / "best" / "onnx" / "task001.onnx"
+        if not best_path.exists():
+            self.skipTest("best ONNX assets are not present")
+        response = client.get("/api/best-graph/task001")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["taskId"], "task001")
+        self.assertTrue(data["meta"]["rawOnnx"])
+        self.assertGreater(len(data["nodes"]), 0)
+        self.assertGreater(len(data["edges"]), 0)
+        self.assertIn("Slice", data["meta"]["opTypes"])
 
 
 if __name__ == "__main__":

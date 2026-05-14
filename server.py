@@ -25,6 +25,7 @@ load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 CLIENT_DIST = ROOT / "client" / "dist"
+CLIENT_PUBLIC = ROOT / "client" / "public"
 BANNED_OPS = {"Loop", "Scan", "NonZero", "Unique", "Script", "Function"}
 SUPPORTED_OPS = {
     "Input",
@@ -35,13 +36,30 @@ SUPPORTED_OPS = {
     "Equal",
     "Greater",
     "Less",
+    "GreaterOrEqual",
+    "LessOrEqual",
     "Not",
     "And",
+    "Or",
+    "Xor",
     "Add",
     "Sub",
     "Mul",
     "Div",
+    "Mod",
+    "Min",
+    "Max",
+    "Sum",
+    "Relu",
+    "Abs",
+    "Neg",
+    "Floor",
+    "Clip",
+    "Sign",
+    "Sqrt",
     "ReduceSum",
+    "ReduceMax",
+    "ReduceMin",
     "ArgMax",
     "Where",
     "Slice",
@@ -72,11 +90,28 @@ INPUT_SLOT_ORDER = {
     "Equal": ["a", "b"],
     "Greater": ["a", "b"],
     "Less": ["a", "b"],
+    "GreaterOrEqual": ["a", "b"],
+    "LessOrEqual": ["a", "b"],
     "And": ["a", "b"],
+    "Or": ["a", "b"],
+    "Xor": ["a", "b"],
     "Add": ["a", "b"],
     "Sub": ["a", "b"],
     "Mul": ["a", "b"],
     "Div": ["a", "b"],
+    "Mod": ["a", "b"],
+    "Min": ["a", "b"],
+    "Max": ["a", "b"],
+    "Sum": ["a", "b"],
+    "Relu": ["input"],
+    "Abs": ["input"],
+    "Neg": ["input"],
+    "Floor": ["input"],
+    "Clip": ["input"],
+    "Sign": ["input"],
+    "Sqrt": ["input"],
+    "ReduceMax": ["input"],
+    "ReduceMin": ["input"],
     "Where": ["condition", "true", "false"],
     "Concat": ["a", "b"],
 }
@@ -183,6 +218,12 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
         return {"axis": int(attrs.get("axis", 1)), "keepdims": int(attrs.get("keepdims", 1))}
     if op == "ReduceSum":
         return {"keepdims": int(attrs.get("keepdims", 1))}
+    if op in {"ReduceMax", "ReduceMin"}:
+        result = {"keepdims": int(attrs.get("keepdims", 1))}
+        if "axes" in attrs:
+            axes = attrs["axes"] if isinstance(attrs["axes"], list) else [attrs["axes"]]
+            result["axes"] = [int(axis) for axis in axes]
+        return result
     if op == "Concat":
         return {"axis": int(attrs.get("axis", 1))}
     if op == "Transpose":
@@ -204,6 +245,8 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
         if "dilations" in attrs:
             result["dilations"] = [int(item) for item in attrs["dilations"]]
         return result
+    if op == "Mod":
+        return {"fmod": int(attrs.get("fmod", 0))}
     return {}
 
 
@@ -396,11 +439,19 @@ def _incoming_ids(node_id: str, op: str, incoming: dict[str, list[dict[str, Any]
     slot_order = INPUT_SLOT_ORDER.get(op, [])
     slot_index = {slot: index for index, slot in enumerate(slot_order)}
     seen_slots: set[str] = set()
+
+    def sort_index(slot: str) -> int:
+        if slot in slot_index:
+            return slot_index[slot]
+        if re.match(r"^in\d+$", slot):
+            return int(slot[2:])
+        return len(slot_order)
+
     for edge in incoming.get(node_id, []):
         slot = str(edge.get("targetHandle") or "").strip()
         if not slot:
             continue
-        if slot not in slot_index:
+        if slot not in slot_index and not re.match(r"^in\d+$", slot):
             raise ValueError(f"{op} node {node_id!r} has unknown input slot {slot!r}")
         if slot in seen_slots:
             raise ValueError(f"{op} node {node_id!r} has multiple edges for input slot {slot!r}")
@@ -408,7 +459,7 @@ def _incoming_ids(node_id: str, op: str, incoming: dict[str, list[dict[str, Any]
     edges = sorted(
         incoming.get(node_id, []),
         key=lambda edge: (
-            slot_index.get(str(edge.get("targetHandle") or "").strip(), len(slot_order)),
+            sort_index(str(edge.get("targetHandle") or "").strip()),
             str(edge.get("source") or ""),
             str(edge.get("id") or ""),
         ),
@@ -422,6 +473,8 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Identity": 1,
         "Not": 1,
         "ReduceSum": 1,
+        "ReduceMax": 1,
+        "ReduceMin": 1,
         "ArgMax": 1,
         "Slice": 1,
         "Pad": 1,
@@ -432,19 +485,33 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Equal": 2,
         "Greater": 2,
         "Less": 2,
+        "GreaterOrEqual": 2,
+        "LessOrEqual": 2,
         "And": 2,
+        "Or": 2,
+        "Xor": 2,
         "Add": 2,
         "Sub": 2,
         "Mul": 2,
         "Div": 2,
+        "Mod": 2,
         "Where": 3,
         "Output": 1,
+        "Relu": 1,
+        "Abs": 1,
+        "Neg": 1,
+        "Floor": 1,
+        "Clip": 1,
+        "Sign": 1,
+        "Sqrt": 1,
     }
     expected = required.get(op)
     if expected is not None and len(ids) != expected:
         raise ValueError(f"{op} node {node_id!r} requires {expected} input edge(s), got {len(ids)}")
     if op == "Concat" and len(ids) < 2:
         raise ValueError(f"Concat node {node_id!r} requires at least 2 input edge(s), got {len(ids)}")
+    if op in {"Min", "Max", "Sum"} and len(ids) < 2:
+        raise ValueError(f"{op} node {node_id!r} requires at least 2 input edge(s), got {len(ids)}")
 
 
 def _constant_array(data: dict[str, Any], shape: list[int]) -> np.ndarray:
@@ -538,14 +605,33 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
         out_type = input_types[0]
         node_inputs = inputs
 
-        if op in {"Equal", "Greater", "Less", "And", "Add", "Sub", "Mul", "Div", "Where"}:
+        same_shape_ops = {
+            "Equal",
+            "Greater",
+            "Less",
+            "GreaterOrEqual",
+            "LessOrEqual",
+            "And",
+            "Or",
+            "Xor",
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Mod",
+            "Min",
+            "Max",
+            "Sum",
+            "Where",
+        }
+        if op in same_shape_ops:
             for idx, input_shape in enumerate(input_shapes, start=1):
                 if input_shape != input_shapes[0]:
                     raise ValueError(f"{op} node {node_id!r} input {idx} shape {input_shape} does not match {input_shapes[0]}")
             shape = input_shapes[0]
-        if op in {"Equal", "Greater", "Less"}:
+        if op in {"Equal", "Greater", "Less", "GreaterOrEqual", "LessOrEqual"}:
             out_type = TensorProto.BOOL
-        elif op in {"Not", "And"}:
+        elif op in {"Not", "And", "Or", "Xor"}:
             out_type = TensorProto.BOOL
         elif op == "Cast":
             out_type = _tensor_type_for_cast(attrs)
@@ -553,15 +639,28 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             if input_types[1] != input_types[2]:
                 raise ValueError(f"Where node {node_id!r} true/false inputs must have matching tensor types")
             out_type = input_types[1]
-        elif op == "ReduceSum":
+        elif op in {"ReduceSum", "ReduceMax", "ReduceMin"}:
             axes = attrs.get("axes")
             shape = _output_shape_for_reduction(input_shapes[0], attrs)
-            if axes is not None:
+            if op == "ReduceSum" and axes is not None:
                 if isinstance(axes, int):
                     axes = [axes]
                 axes_name = f"{node_id}_axes"
                 initializers.append(helper.make_tensor(axes_name, TensorProto.INT64, [len(axes)], [int(axis) for axis in axes]))
                 node_inputs = [inputs[0], axes_name]
+        elif op == "Clip":
+            if "min" in attrs or "max" in attrs:
+                node_inputs = [inputs[0]]
+                if "min" in attrs:
+                    min_name = f"{node_id}_min"
+                    initializers.append(helper.make_tensor(min_name, TensorProto.FLOAT, [], [float(attrs["min"])]))
+                    node_inputs.append(min_name)
+                elif "max" in attrs:
+                    node_inputs.append("")
+                if "max" in attrs:
+                    max_name = f"{node_id}_max"
+                    initializers.append(helper.make_tensor(max_name, TensorProto.FLOAT, [], [float(attrs["max"])]))
+                    node_inputs.append(max_name)
         elif op == "ArgMax":
             shape = _output_shape_for_argmax(input_shapes[0], attrs)
             out_type = TensorProto.INT64
@@ -671,6 +770,199 @@ def _model_summary(model: onnx.ModelProto) -> dict[str, Any]:
     return {
         "inputs": [_value_info_summary(item) for item in model.graph.input],
         "outputs": [_value_info_summary(item) for item in model.graph.output],
+    }
+
+
+def _safe_id(value: str, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_").lower()
+    return text or fallback
+
+
+def _shape_from_value_info(value_info: onnx.ValueInfoProto) -> list[int | str | None]:
+    tensor_type = value_info.type.tensor_type
+    return [_dim_value(dim) for dim in tensor_type.shape.dim]
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, onnx.TensorProto):
+        array = numpy_helper.to_array(value)
+        return {
+            "kind": "tensor",
+            "dataType": int(value.data_type),
+            "shape": list(array.shape),
+            "size": int(array.size),
+            "valuesPreview": array.reshape(-1)[:12].tolist(),
+        }
+    if isinstance(value, onnx.GraphProto):
+        return {"kind": "graph", "name": value.name, "nodeCount": len(value.node)}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _onnx_attrs_for_gui(node: onnx.NodeProto) -> dict[str, Any]:
+    return {attr.name: _json_ready(helper.get_attribute_value(attr)) for attr in node.attribute}
+
+
+def _best_onnx_path(task_id: str) -> Path:
+    task_id = task_id.strip().lower()
+    if not TASK_ID_RE.match(task_id):
+        raise ValueError("taskId must match taskXXX, for example task010")
+    candidates = [
+        CLIENT_DIST / "best" / "onnx" / f"{task_id}.onnx",
+        CLIENT_PUBLIC / "best" / "onnx" / f"{task_id}.onnx",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"No best ONNX file found for {task_id}")
+
+
+def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
+    path = _best_onnx_path(task_id)
+    model = onnx.load(path)
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    producers: dict[str, str] = {}
+    occupied_ids: set[str] = set()
+
+    def unique_id(raw: str, fallback: str) -> str:
+        base = _safe_id(raw, fallback)
+        candidate = base
+        suffix = 2
+        while candidate in occupied_ids:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        occupied_ids.add(candidate)
+        return candidate
+
+    def add_node(raw_id: str, fallback: str, op_type: str, index: int, data: dict[str, Any]) -> str:
+        node_id = unique_id(raw_id, fallback)
+        nodes.append(
+            {
+                "id": node_id,
+                "type": "op",
+                "position": {"x": 70 + (index % 8) * 210, "y": 80 + (index // 8) * 130},
+                "data": {"label": node_id, "opType": op_type, **data},
+            }
+        )
+        return node_id
+
+    index = 0
+    initializer_names = {item.name for item in model.graph.initializer}
+    for value_info in model.graph.input:
+        if value_info.name in initializer_names:
+            continue
+        node_id = add_node(
+            value_info.name,
+            f"input_{index}",
+            "Input",
+            index,
+            {
+                "shape": ",".join(str(item) for item in _shape_from_value_info(value_info)),
+                "sourceName": value_info.name,
+                "inputSlots": [],
+            },
+        )
+        producers[value_info.name] = node_id
+        index += 1
+
+    for initializer in model.graph.initializer:
+        array = numpy_helper.to_array(initializer)
+        node_id = add_node(
+            initializer.name,
+            f"init_{index}",
+            "Constant",
+            index,
+            {
+                "shape": ",".join(str(item) for item in array.shape),
+                "sourceName": initializer.name,
+                "inputSlots": [],
+                "attrs": {
+                    "source": "onnx-initializer",
+                    "dataType": int(initializer.data_type),
+                    "size": int(array.size),
+                    "valuesPreview": array.reshape(-1)[:12].tolist(),
+                },
+            },
+        )
+        producers[initializer.name] = node_id
+        index += 1
+
+    for node_index, onnx_node in enumerate(model.graph.node, start=1):
+        slots = [f"in{slot_index}" for slot_index, name in enumerate(onnx_node.input) if name]
+        node_id = add_node(
+            onnx_node.name or f"{onnx_node.op_type}_{node_index}",
+            f"onnx_{node_index}",
+            onnx_node.op_type,
+            index,
+            {
+                "sourceName": onnx_node.name,
+                "inputSlots": slots,
+                "attrs": _onnx_attrs_for_gui(onnx_node),
+            },
+        )
+        index += 1
+        visible_slot = 0
+        for input_index, input_name in enumerate(onnx_node.input):
+            if not input_name:
+                continue
+            source_id = producers.get(input_name)
+            if source_id:
+                slot = f"in{visible_slot}"
+                edges.append(
+                    {
+                        "id": f"e_{len(edges) + 1}",
+                        "source": source_id,
+                        "target": node_id,
+                        "targetHandle": slot,
+                        "data": {"tensor": input_name, "inputIndex": input_index},
+                    }
+                )
+            visible_slot += 1
+        for output_name in onnx_node.output:
+            if output_name:
+                producers[output_name] = node_id
+
+    for output_index, output in enumerate(model.graph.output, start=1):
+        node_id = add_node(
+            f"output_{output.name}",
+            f"output_{output_index}",
+            "Output",
+            index,
+            {
+                "shape": ",".join(str(item) for item in _shape_from_value_info(output)),
+                "sourceName": output.name,
+                "inputSlots": ["input"],
+            },
+        )
+        index += 1
+        source_id = producers.get(output.name)
+        if source_id:
+            edges.append(
+                {
+                    "id": f"e_{len(edges) + 1}",
+                    "source": source_id,
+                    "target": node_id,
+                    "targetHandle": "input",
+                    "data": {"tensor": output.name},
+                }
+            )
+
+    return {
+        "projectName": f"best-{task_id}-onnx",
+        "taskId": task_id,
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "source": str(path.relative_to(ROOT)),
+            "rawOnnx": True,
+            "nodeCount": len(model.graph.node),
+            "initializerCount": len(model.graph.initializer),
+            "opTypes": sorted({node.op_type for node in model.graph.node}),
+        },
     }
 
 
@@ -869,6 +1161,14 @@ def export_onnx(payload: ExportPayload):
         return JSONResponse(status_code=400, content={"status": "failed", "reason": str(exc)})
     except Exception as exc:
         return JSONResponse(status_code=400, content={"status": "failed", "reason": str(exc)})
+
+
+@app.get("/api/best-graph/{task_id}")
+def best_graph(task_id: str):
+    try:
+        return onnx_to_gui_graph(task_id)
+    except Exception as exc:
+        return JSONResponse(status_code=404, content={"status": "failed", "reason": str(exc)})
 
 
 if CLIENT_DIST.exists():
