@@ -4,3 +4,4 @@ python-dotenv
 onnx
 onnxruntime
 huggingface_hub
+kaggle

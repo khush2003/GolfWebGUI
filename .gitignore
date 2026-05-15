@@ -19,6 +19,8 @@ client/playwright-report/
 *.onnx
 tmp*/
 temp*/
+runs/
+.run/
 
 cloudflared.log
 server.log

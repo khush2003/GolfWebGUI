@@ -1,0 +1,347 @@
+{
+  "schema_version": "1.2.0-neurogolf-headless-guarded-submit",
+  "generated_at": "2026-05-14",
+  "system_name": "NeuroGolf 2026 Headless Agent Web GUI + Guarded Kaggle Submission Pipeline",
+  "competition": {
+    "slug": "neurogolf-2026",
+    "url": "https://www.kaggle.com/competitions/neurogolf-2026",
+    "submission_artifact": "submission.zip",
+    "submission_contents": "At most one ONNX file per task, named task001.onnx through task400.onnx.",
+    "objective": "Use the NeuroGolf web GUI and headless scripts as the control plane. Generate or ingest candidate ONNX artifacts, run only allowed preflight and changed-task checks, package measured improvements, submit through the guarded Kaggle wrapper, then use the public leaderboard score as tactical truth.",
+    "constraints_to_verify": [
+      "Each ONNX file is <= 1.44 MB.",
+      "Submission zip opens and contains only valid taskXXX.onnx names.",
+      "No banned/disallowed operations or metric-loophole-only submissions.",
+      "No private, leaked, or unauthorized source material.",
+      "No credentials in logs, manifests, Hugging Face artifacts, or git."
+    ]
+  },
+  "implementation_status": {
+    "available_now": [
+      "NeuroGolf web GUI on port 8081",
+      "best ONNX visual import endpoint: /api/best-graph/{task_id}",
+      "live Export Payload Inspector",
+      "private local best zip ignored by git",
+      "scripts/score_candidate.py",
+      "scripts/build_submission_zip.py",
+      "scripts/kaggle_auth.py",
+      "scripts/kaggle_guarded_submit.py",
+      "errors.md run issue log"
+    ],
+    "planned_or_optional": [
+      "Hugging Face private artifact bus scripts",
+      "headless GUI kanban/card API",
+      "Kaggle Cloud CPU build worker",
+      "automatic leaderboard polling/writeback"
+    ],
+    "truthful_current_transport": "local_private_best_zip_to_guarded_kaggle_submit",
+    "future_transport": "HF_private_repo_artifact_pull_to_guarded_kaggle_submit"
+  },
+  "run_config": {
+    "mode": "one_submit_then_iterate",
+    "duration_minutes": 240,
+    "timezone": "America/Indiana/Indianapolis",
+    "initial_submit_limit": 1,
+    "max_submissions_full_run": 100,
+    "max_submissions_per_day": 100,
+    "submit_one_at_a_time": true,
+    "minimum_seconds_between_submissions": 180,
+    "public_leaderboard_is_ultimate_truth": true,
+    "public_leaderboard_is_tactical_baseline": true,
+    "expensive_local_tests_forbidden": true,
+    "allowed_local_actions": [
+      "fast JSON/schema sanity checks",
+      "zip manifest inspection",
+      "filename checks",
+      "ONNX file size checks",
+      "SHA256 hashing",
+      "credential/env checks",
+      "log/kanban state checks",
+      "changed-task compile/run scoring through scripts/score_candidate.py when it is fast"
+    ],
+    "forbidden_local_actions": [
+      "full all-task local validation loops",
+      "slow solver sweeps",
+      "direct kaggle competitions submit",
+      "submitting more than the current Kaggle daily limit",
+      "submitting a zip without a promoted score report",
+      "submitting again before 180 seconds"
+    ],
+    "required_env": [
+      "KAGGLE_USERNAME",
+      "KAGGLE_KEY"
+    ],
+    "optional_env_for_future_hf_bus": [
+      "HF_TOKEN",
+      "HF_PRIVATE_REPO_ID",
+      "HF_REPO_TYPE",
+      "HEADLESS_GUI_URL",
+      "HEADLESS_GUI_TOKEN"
+    ]
+  },
+  "gates": {
+    "candidate_promotion_requires": [
+      "candidate graph exists",
+      "scripts/score_candidate.py produced a report",
+      "report.decision.promote == true",
+      "no train regression",
+      "no test or arc-gen regression against current best when available",
+      "candidate improvement is described in the message"
+    ],
+    "package_requires": [
+      "private base submission zip exists locally",
+      "all candidate reports are promoted",
+      "patched ONNX compiles from graph JSON",
+      "output zip SHA256 is recorded in sidecar manifest"
+    ],
+    "submit_requires": [
+      "Kaggle auth check passes without printing secrets",
+      "zip exists",
+      "at least one promoted report is attached",
+      "last submission age is >= 180 seconds or no prior submission exists",
+      "no other candidate is in flight",
+      "pre-submit log entry is prepared"
+    ]
+  },
+  "commands": {
+    "auth": "/usr/bin/python3.12 scripts/kaggle_auth.py --install --write-from-env",
+    "score_candidate": "/usr/bin/python3.12 scripts/score_candidate.py --task task010 --graph graph.json --out runs/reports/task010-report.json",
+    "build_zip": "/usr/bin/python3.12 scripts/build_submission_zip.py --candidate task010=graph.json --report runs/reports/task010-report.json --message \"task010 measured improvement\"",
+    "guarded_submit": "/usr/bin/python3.12 scripts/kaggle_guarded_submit.py --zip runs/submissions/submission.zip --report runs/reports/task010-report.json --message \"measured improvement\"",
+    "guarded_submit_dry_run": "/usr/bin/python3.12 scripts/kaggle_guarded_submit.py --zip runs/submissions/submission.zip --report runs/reports/task010-report.json --message \"measured improvement\" --dry-run",
+    "status": "kaggle competitions submissions -c neurogolf-2026"
+  },
+  "phase_plan": [
+    {
+      "phase": "P0_auth_and_preflight",
+      "timebox_minutes": 10,
+      "goal": "Authenticate Kaggle, smoke-check web GUI and local private best artifacts, and prepare the first guarded submission lane.",
+      "exit_criteria": [
+        "kaggle auth check passes",
+        "http://127.0.0.1:8081/ returns 200",
+        "private base submission zip exists locally",
+        "errors.md is ready",
+        "no expensive local tests are run"
+      ]
+    },
+    {
+      "phase": "P1_one_submit",
+      "timebox_minutes": 20,
+      "goal": "Make exactly one guarded submission from a promoted candidate or known safe baseline, then stop for score readback.",
+      "exit_criteria": [
+        "exactly one candidate zip submitted",
+        "submission used scripts/kaggle_guarded_submit.py",
+        "submit log written",
+        "public score or pending status recorded",
+        "no second submission before cooldown"
+      ]
+    },
+    {
+      "phase": "P2_task_update_work",
+      "timebox_minutes": 120,
+      "goal": "Work on measured task updates, using changed-task fast scoring only and packaging only improvements.",
+      "exit_criteria": [
+        "candidate reports exist for attempted tasks",
+        "failures and bugs are appended to errors.md",
+        "promoted candidates are packaged into zip variants",
+        "non-promoted candidates are not submitted"
+      ]
+    },
+    {
+      "phase": "P3_guarded_submission_cycle",
+      "timebox_minutes": 90,
+      "goal": "Submit up to the remaining allowed improved zips, one at a time, respecting the 180-second cooldown.",
+      "exit_criteria": [
+        "every submitted zip has at least one promoted report",
+        "no random zip submitted",
+        "every public score is recorded",
+        "best public score is preserved"
+      ]
+    },
+    {
+      "phase": "P4_finalize",
+      "timebox_minutes": 20,
+      "goal": "Summarize score movement, preserve best candidate, and rank next fixes from errors.md.",
+      "exit_criteria": [
+        "best submission identified by public leaderboard score",
+        "errors.md contains follow-up bugs/fixes",
+        "next-run targets are ranked",
+        "no unlogged submissions"
+      ]
+    }
+  ],
+  "roles": {
+    "orchestrator": {
+      "mission": "Own clock, gates, one-at-a-time policy, and stop/go decisions.",
+      "hard_blocks": [
+        "unpromoted report",
+        "cooldown not met",
+        "missing auth",
+        "missing zip",
+        "another candidate in flight"
+      ]
+    },
+    "candidate_builder": {
+      "mission": "Create graph JSON candidates and compiler updates.",
+      "outputs": [
+        "graph.json",
+        "brief hypothesis",
+        "changed task list"
+      ]
+    },
+    "scorer": {
+      "mission": "Run scripts/score_candidate.py and decide promote/archive.",
+      "outputs": [
+        "runs/reports/*.json",
+        "promotion decision"
+      ]
+    },
+    "packager": {
+      "mission": "Patch promoted candidates into a private-base submission zip.",
+      "outputs": [
+        "runs/submissions/*.zip",
+        "runs/submissions/*.manifest.json"
+      ]
+    },
+    "submitter": {
+      "mission": "Submit only through scripts/kaggle_guarded_submit.py and record public score/status.",
+      "hard_blocks": [
+        "direct Kaggle CLI submit",
+        "less than 180 seconds since last submit",
+        "missing promoted report"
+      ]
+    }
+  },
+  "error_logging": {
+    "file": "errors.md",
+    "append_for": [
+      "auth failures",
+      "compile failures",
+      "runtime failures",
+      "zip packaging failures",
+      "Kaggle CLI failures",
+      "leaderboard anomalies",
+      "missing scripts or missing private artifacts"
+    ],
+    "template_fields": [
+      "time",
+      "task",
+      "phase",
+      "symptom",
+      "command",
+      "error",
+      "suspected cause",
+      "fix now",
+      "fix after run",
+      "status"
+    ]
+  },
+  "submission_policy": {
+    "cooldown_seconds": 180,
+    "one_at_a_time": true,
+    "in_flight_limit": 1,
+    "direct_kaggle_submit_forbidden": true,
+    "wrapper": "scripts/kaggle_guarded_submit.py",
+    "allow_when_all_true": [
+      "zip exists",
+      "all attached reports have decision.promote == true",
+      "now - last_submission_at >= 180 seconds OR last_submission_at is null",
+      "no other candidate awaiting leaderboard score",
+      "message describes measured improvement"
+    ],
+    "block_when_any_true": [
+      "unpromoted report",
+      "cooldown not met",
+      "missing kaggle auth",
+      "missing zip",
+      "attempting random or unmeasured zip",
+      "attempting direct kaggle competitions submit"
+    ]
+  },
+  "graph_node_palette": {
+    "dedupe_policy": "The UI/config normalizes duplicate names; Add and Constant appear once even if listed multiple times in a prompt.",
+    "ops": [
+      "Abs",
+      "Add",
+      "And",
+      "ArgMax",
+      "AveragePool",
+      "Cast",
+      "Clip",
+      "ColIndex",
+      "Concat",
+      "Constant",
+      "Conv",
+      "ConvTranspose",
+      "CumSum",
+      "Div",
+      "Equal",
+      "Expand",
+      "Flatten",
+      "Floor",
+      "Gather",
+      "GatherElements",
+      "GatherND",
+      "Gemm",
+      "Greater",
+      "GreaterOrEqual",
+      "GridSample",
+      "Identity",
+      "Input",
+      "Less",
+      "LessOrEqual",
+      "MatMul",
+      "Max",
+      "MaxPool",
+      "Min",
+      "Mod",
+      "Mul",
+      "Neg",
+      "Not",
+      "OneHot",
+      "Or",
+      "Output",
+      "Pad",
+      "QLinearMatMul",
+      "ReduceMax",
+      "ReduceMin",
+      "ReduceSum",
+      "Relu",
+      "Reshape",
+      "Resize",
+      "RowIndex",
+      "ScatterElements",
+      "Sign",
+      "Slice",
+      "Split",
+      "Sqrt",
+      "Squeeze",
+      "Sub",
+      "Sum",
+      "Tile",
+      "TopK",
+      "Transpose",
+      "Unsqueeze",
+      "Where",
+      "Xor"
+    ],
+    "custom_neurogolf_ops": [
+      "RowIndex",
+      "ColIndex"
+    ],
+    "compile_policy": "Nodes may be used in visual/imported graphs. If compile_graph does not yet support an op, add it deliberately through COMPILER_TODOS.md and tests before relying on it in a candidate.",
+    "source": "union of GUI base ops and op types observed in the private best-submission ONNX manifest"
+  },
+  "graph_node_policy": {
+    "missing_needed_node_rule": "If a candidate or paper-derived solution requires a node/op that is not in the GUI palette or compiler, add the node deliberately instead of abandoning the solution.",
+    "required_steps": [
+      "add the op to the GUI palette/input slot metadata",
+      "add compiler support or a documented COMPILER_TODOS.md entry when full support is not possible immediately",
+      "add backend tests for compile_graph behavior",
+      "add or update e2e coverage when the node must be selectable in the GUI",
+      "run pytest, frontend build, and relevant smoke/e2e checks",
+      "record any partial support or known limitation in errors.md during a run"
+    ],
+    "hard_rule": "Do not silently substitute a weaker graph when the missing node is the core primitive needed for the task family."
+  }
+}
