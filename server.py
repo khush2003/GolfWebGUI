@@ -23,6 +23,14 @@ except Exception as exc:  # pragma: no cover
 
 load_dotenv()
 
+
+def _ort_providers() -> list[str]:
+    available = set(ort.get_available_providers())
+    if "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
 ROOT = Path(__file__).resolve().parent
 CLIENT_DIST = ROOT / "client" / "dist"
 CLIENT_PUBLIC = ROOT / "client" / "public"
@@ -1060,7 +1068,7 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
         raise ValidationError("Phase 1 Strict Equivalence failed: no ARC training pairs were supplied")
 
     try:
-        session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
     except Exception as exc:
         raise ValidationError(f"Phase 1 Strict Equivalence failed: ONNX Runtime could not load model: {exc}") from exc
 
@@ -1132,7 +1140,7 @@ def run_onnx(payload: RunPayload):
             source_grid = payload.trainingPairs[0].get("input")
         if source_grid is None:
             raise ValueError("Run input grid is missing")
-        session = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
         actual, region = _run_session(session, source_grid)
         _assert_color_bounds("Run", actual)
         return {
