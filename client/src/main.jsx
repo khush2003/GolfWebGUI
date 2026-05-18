@@ -600,14 +600,40 @@ function App() {
     setValidation({ state: "loading", taskId });
     setLastExport({ state: "loading", taskId, at: nowLabel() });
     try {
-      const { data } = await axios.post("/api/export", exportPayload);
-      setValidation({ state: "passed", taskId, artifact: data.artifact });
-      setLastExport({ state: "passed", taskId, artifact: data.artifact, at: nowLabel() });
-      setStatus(`Validation passed. Exported ${data.artifact}`);
+      const response = await axios.post("/api/export", exportPayload, { responseType: "blob" });
+      const ct = response.headers["content-type"] || "";
+      const fname = `${taskId}.onnx`;
+      if (ct.includes("application/json")) {
+        const data = JSON.parse(await response.data.text());
+        setValidation({ state: "passed", taskId, artifact: data.artifact });
+        setLastExport({ state: "passed", taskId, artifact: data.artifact, at: nowLabel() });
+        setStatus(`Validation passed. Exported ${data.artifact}`);
+      } else {
+        const url = URL.createObjectURL(response.data);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        setValidation({ state: "passed", taskId, artifact: fname });
+        setLastExport({ state: "passed", taskId, artifact: fname, at: nowLabel() });
+        setLastDownload({ state: "downloaded", name: fname, taskId, at: nowLabel() });
+        setStatus(`Validation passed. Downloaded ${fname}`);
+      }
     } catch (error) {
-      const response = error.response?.data;
-      const rawReason = response?.reason || response?.detail?.reason || response?.detail || error.message;
-      const reason = typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason);
+      let reason = error.message;
+      if (error.response?.data) {
+        try {
+          const text = await error.response.data.text();
+          const parsed = JSON.parse(text);
+          reason = parsed.reason || parsed.detail?.reason || parsed.detail || reason;
+        } catch {
+          reason = error.message;
+        }
+      }
+      if (typeof reason !== "string") reason = JSON.stringify(reason);
       setValidation({ state: "failed", taskId, reason });
       setLastExport({ state: "failed", taskId, reason, at: nowLabel() });
       setStatus("Validation failed");

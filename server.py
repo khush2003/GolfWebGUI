@@ -10,7 +10,7 @@ import onnxruntime as ort
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import HfApi
 from onnx import TensorProto, helper, numpy_helper
@@ -1166,7 +1166,12 @@ def export_onnx(payload: ExportPayload):
         token = os.getenv("HF_TOKEN")
         repo_id = os.getenv("HF_REPO_ID")
         if not token or not repo_id:
-            raise ValueError("HF_TOKEN and HF_REPO_ID are required")
+            return FileResponse(
+                str(artifact),
+                media_type="application/octet-stream",
+                filename=f"{task_id}.onnx",
+                headers={"X-Validation": "passed"},
+            )
         api = HfApi(token=token)
         _assert_hf_repo_matches_token(api, repo_id)
         remote_path = f"{task_id}.onnx"
