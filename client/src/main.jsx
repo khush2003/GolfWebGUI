@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactFlow, { Background, Controls, Handle, Position, addEdge, useEdgesState, useNodesState } from "reactflow";
 import axios from "axios";
@@ -379,6 +379,8 @@ function App() {
   const [lastRun, setLastRun] = useState({ state: "idle" });
   const [lastExport, setLastExport] = useState({ state: "idle" });
   const [lastDownload, setLastDownload] = useState({ state: "idle" });
+  const [lastImport, setLastImport] = useState({ state: "idle" });
+  const importInputRef = useRef(null);
   const exampleSets = useMemo(() => ({
     train: currentTask?.train || [],
     test: currentTask?.test || [],
@@ -549,6 +551,29 @@ function App() {
     resetTransientGraphState();
     setStatus(`Loaded project ${project.name}`);
     scheduleFitView();
+  };
+
+  const importOnnx = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (files.length === 0) return;
+    setLastImport({ state: "loading", count: files.length, at: nowLabel() });
+    setStatus(`Importing ${files.length} ONNX file${files.length === 1 ? "" : "s"}`);
+    const form = new FormData();
+    for (const file of files) form.append("files", file, file.name);
+    try {
+      const { data } = await axios.post("/api/import", form);
+      const saved = data.saved || [];
+      const rejected = data.rejected || [];
+      setLastImport({ state: "ok", saved, rejected, at: nowLabel() });
+      const parts = [`${saved.length} saved`];
+      if (rejected.length) parts.push(`${rejected.length} rejected`);
+      setStatus(`Import: ${parts.join(", ")}`);
+    } catch (error) {
+      const reason = error.response?.data?.reason || error.message;
+      setLastImport({ state: "failed", reason, at: nowLabel() });
+      setStatus(`Import failed: ${reason}`);
+    }
   };
 
   const loadBestGraph = async () => {
@@ -760,6 +785,30 @@ function App() {
             {availableProjects.map((item) => <option key={item.name} value={item.name}>{item.name}{item.source === "template" ? " (template)" : ""}</option>)}
           </select>
           <button className="btn full" onClick={loadProject} disabled={availableProjects.length === 0}>Load Selected</button>
+        </section>
+        <section>
+          <h2>IMPORT ONNX</h2>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".onnx"
+            multiple
+            style={{ display: "none" }}
+            onChange={importOnnx}
+            aria-label="Import ONNX files"
+          />
+          <button className="btn full" onClick={() => importInputRef.current?.click()} disabled={lastImport.state === "loading"}>
+            <Upload size={15} />{lastImport.state === "loading" ? "Uploading..." : "Pick task001.onnx ... taskNNN.onnx"}
+          </button>
+          {lastImport.state === "ok" && (
+            <div className="muted" style={{ marginTop: 6 }}>
+              {lastImport.saved.length ? `Saved: ${lastImport.saved.join(", ")}` : "No files saved"}
+              {lastImport.rejected.length ? ` · Rejected: ${lastImport.rejected.length}` : ""}
+            </div>
+          )}
+          {lastImport.state === "failed" && (
+            <div className="muted" style={{ marginTop: 6 }}>Failed: {lastImport.reason}</div>
+          )}
         </section>
         <section>
           <h2>BEST TEMPLATE</h2>

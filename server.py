@@ -8,7 +8,7 @@ from typing import Any
 import onnx
 import onnxruntime as ort
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +34,8 @@ def _ort_providers() -> list[str]:
 ROOT = Path(__file__).resolve().parent
 CLIENT_DIST = ROOT / "client" / "dist"
 CLIENT_PUBLIC = ROOT / "client" / "public"
+IMPORT_DIR = Path(os.getenv("IMPORT_DIR", "/tmp/neurogolf_imports"))
+IMPORT_DIR.mkdir(parents=True, exist_ok=True)
 BANNED_OPS = {"Loop", "Scan", "NonZero", "Unique", "Script", "Function"}
 SUPPORTED_OPS = {
     "Input",
@@ -837,6 +839,7 @@ def _best_onnx_path(task_id: str) -> Path:
     if not TASK_ID_RE.match(task_id):
         raise ValueError("taskId must match taskXXX, for example task010")
     candidates = [
+        IMPORT_DIR / f"{task_id}.onnx",
         CLIENT_DIST / "best" / "onnx" / f"{task_id}.onnx",
         CLIENT_PUBLIC / "best" / "onnx" / f"{task_id}.onnx",
     ]
@@ -1201,6 +1204,51 @@ def best_graph(task_id: str):
         return onnx_to_gui_graph(task_id)
     except Exception as exc:
         return JSONResponse(status_code=404, content={"status": "failed", "reason": str(exc)})
+
+
+_IMPORT_NAME_RE = re.compile(r"^(task\d{3})\.onnx$")
+
+
+@app.post("/api/import")
+async def import_onnx(files: list[UploadFile] = File(...)):
+    saved: list[str] = []
+    rejected: list[dict[str, str]] = []
+    for upload in files:
+        name = (upload.filename or "").strip().lower()
+        match = _IMPORT_NAME_RE.match(name)
+        if not match:
+            rejected.append({"filename": upload.filename or "", "reason": "name must match taskNNN.onnx"})
+            continue
+        task_id = match.group(1)
+        data = await upload.read()
+        try:
+            onnx.load_from_string(data)
+        except Exception as exc:
+            rejected.append({"filename": upload.filename, "reason": f"not a valid ONNX model: {exc}"})
+            continue
+        (IMPORT_DIR / f"{task_id}.onnx").write_bytes(data)
+        saved.append(task_id)
+    return {"status": "ok", "saved": saved, "rejected": rejected, "import_dir": str(IMPORT_DIR)}
+
+
+@app.get("/api/import/list")
+def import_list():
+    items = []
+    for path in sorted(IMPORT_DIR.glob("task*.onnx")):
+        if _IMPORT_NAME_RE.match(path.name):
+            items.append({"taskId": path.stem, "size": path.stat().st_size})
+    return {"items": items, "import_dir": str(IMPORT_DIR)}
+
+
+@app.delete("/api/import/{task_id}")
+def import_delete(task_id: str):
+    if not TASK_ID_RE.match(task_id):
+        return JSONResponse(status_code=400, content={"status": "failed", "reason": "invalid taskId"})
+    target = IMPORT_DIR / f"{task_id}.onnx"
+    if not target.exists():
+        return JSONResponse(status_code=404, content={"status": "failed", "reason": "not imported"})
+    target.unlink()
+    return {"status": "deleted", "taskId": task_id}
 
 
 if CLIENT_DIST.exists():
