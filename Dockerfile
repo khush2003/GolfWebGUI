@@ -7,7 +7,7 @@ RUN npm install --include=dev --no-audit --no-fund
 COPY client/ ./
 RUN npm run build
 
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04 AS runtime
+FROM python:3.11-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -17,19 +17,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=3000
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip \
-        ca-certificates curl \
- && rm -rf /var/lib/apt/lists/* \
- && python3 -m venv /opt/venv
-
-ENV PATH="/opt/venv/bin:${PATH}"
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN sed -i 's/^onnxruntime$/onnxruntime-gpu/' /app/requirements.txt \
- && pip install --upgrade pip \
+RUN pip install --upgrade pip \
  && pip install -r /app/requirements.txt
 
 COPY server.py /app/server.py
