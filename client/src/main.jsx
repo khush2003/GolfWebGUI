@@ -380,6 +380,7 @@ function App() {
   const [lastExport, setLastExport] = useState({ state: "idle" });
   const [lastDownload, setLastDownload] = useState({ state: "idle" });
   const [lastImport, setLastImport] = useState({ state: "idle" });
+  const [importedTasks, setImportedTasks] = useState(() => new Set());
   const importInputRef = useRef(null);
   const exampleSets = useMemo(() => ({
     train: currentTask?.train || [],
@@ -480,6 +481,19 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    axios.get("/api/import/list")
+      .then(({ data }) => {
+        if (cancelled) return;
+        setImportedTasks(new Set((data.items || []).map((item) => item.taskId)));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const scheduleFitView = () => {
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => reactFlowInstance?.fitView({ padding: 0.2 }));
@@ -553,6 +567,24 @@ function App() {
     scheduleFitView();
   };
 
+  const applyGraphFromBest = async (id) => {
+    try {
+      const { data } = await axios.get(`/api/best-graph/${id}`);
+      setProjectName(data.projectName || `best-${id}-onnx`);
+      setNodes(cloneGraph(data.nodes || []));
+      setEdges(cloneGraph(data.edges || []));
+      resetTransientGraphState();
+      setStatus(`Loaded ONNX graph for ${id}: ${data.meta?.nodeCount || 0} raw nodes`);
+      scheduleFitView();
+      return true;
+    } catch (error) {
+      const response = error.response?.data;
+      const rawReason = response?.reason || response?.detail || error.message;
+      setStatus(`Graph load failed: ${typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason)}`);
+      return false;
+    }
+  };
+
   const importOnnx = async (event) => {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
@@ -566,9 +598,17 @@ function App() {
       const saved = data.saved || [];
       const rejected = data.rejected || [];
       setLastImport({ state: "ok", saved, rejected, at: nowLabel() });
+      setImportedTasks((current) => {
+        const next = new Set(current);
+        for (const id of saved) next.add(id);
+        return next;
+      });
       const parts = [`${saved.length} saved`];
       if (rejected.length) parts.push(`${rejected.length} rejected`);
       setStatus(`Import: ${parts.join(", ")}`);
+      if (saved.includes(taskId)) {
+        await applyGraphFromBest(taskId);
+      }
     } catch (error) {
       const reason = error.response?.data?.reason || error.message;
       setLastImport({ state: "failed", reason, at: nowLabel() });
@@ -577,24 +617,12 @@ function App() {
   };
 
   const loadBestGraph = async () => {
-    if (!bestTask) {
-      setStatus(`No best ONNX graph for ${taskId}`);
+    if (!bestTask && !importedTasks.has(taskId)) {
+      setStatus(`No ONNX graph for ${taskId}`);
       return;
     }
-    setStatus(`Loading best ONNX graph for ${taskId}`);
-    try {
-      const { data } = await axios.get(`/api/best-graph/${taskId}`);
-      setProjectName(data.projectName || `best-${taskId}-onnx`);
-      setNodes(cloneGraph(data.nodes || []));
-      setEdges(cloneGraph(data.edges || []));
-      resetTransientGraphState();
-      setStatus(`Loaded best ONNX graph: ${data.meta?.nodeCount || 0} raw nodes`);
-      scheduleFitView();
-    } catch (error) {
-      const response = error.response?.data;
-      const rawReason = response?.reason || response?.detail || error.message;
-      setStatus(`Best graph load failed: ${typeof rawReason === "string" ? rawReason : JSON.stringify(rawReason)}`);
-    }
+    setStatus(`Loading ONNX graph for ${taskId}`);
+    await applyGraphFromBest(taskId);
   };
 
   const updateSelected = (patch) => {
@@ -814,13 +842,15 @@ function App() {
           <h2>BEST TEMPLATE</h2>
           {bestLoadState === "loaded" && bestManifest ? (
             <div className="bestTemplate">
-              <div className="muted">{bestManifest.fileCount} ONNX files from current best submission</div>
-              {bestTask ? (
+              <div className="muted">{bestManifest.fileCount} bundled · {importedTasks.size} imported</div>
+              {bestTask || importedTasks.has(taskId) ? (
                 <>
-                  <button className="btn full" onClick={loadBestGraph}>Load Graph</button>
-                  <a className="btn full btnLink" href={bestTask.path} download onClick={() => recordDownload(`${taskId}.onnx`, bestTask.path)}>
-                    Task {String(task).padStart(3, "0")} ONNX
-                  </a>
+                  <button className="btn full" onClick={loadBestGraph}>Load Graph{importedTasks.has(taskId) && !bestTask ? " (imported)" : ""}</button>
+                  {bestTask && (
+                    <a className="btn full btnLink" href={bestTask.path} download onClick={() => recordDownload(`${taskId}.onnx`, bestTask.path)}>
+                      Task {String(task).padStart(3, "0")} ONNX
+                    </a>
+                  )}
                 </>
               ) : (
                 <div className="muted">No ONNX file for {taskId}</div>
