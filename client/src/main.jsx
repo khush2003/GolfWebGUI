@@ -623,6 +623,25 @@ function App() {
     setStatus(`Saved ${Object.keys(merged).length} task graph(s) (active: ${taskId})`);
   };
 
+  const revertAllSaved = () => {
+    const fresh = loadStoredGraphs();
+    graphsByTaskRef.current = fresh;
+    setGraphsByTask(fresh);
+    const entry = fresh[taskId];
+    if (entry) {
+      setProjectName(entry.projectName || `neurogolf-${taskId}`);
+      setNodes(cloneGraph(entry.nodes));
+      setEdges(cloneGraph(entry.edges));
+    } else {
+      setProjectName(`neurogolf-${taskId}`);
+      setNodes(cloneGraph(defaultNodes()));
+      setEdges(cloneGraph(defaultEdges()));
+    }
+    resetTransientGraphState();
+    scheduleFitView();
+    setStatus(`Reverted ${Object.keys(fresh).length} task graph(s) to last save`);
+  };
+
   const loadProject = () => {
     const project = availableProjects.find((item) => item.name === selectedProjectName);
     if (!project) {
@@ -936,11 +955,12 @@ function App() {
         <section>
           <h2>PROJECT</h2>
           <input aria-label="Project name" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
-          <div className="twoCol"><button className="btn" onClick={newProject}>New</button><button className="btn" onClick={saveProject}><Save size={15} />Save</button></div>
+          <div className="twoCol"><button className="btn" onClick={newProject}>New</button><button className="btn" onClick={saveProject}><Save size={15} />Save All</button></div>
+          <button className="btn full" onClick={revertAllSaved}>Revert All to Saved</button>
           <select aria-label="Saved project" value={selectedProjectName} onChange={(event) => setSelectedProjectName(event.target.value)}>
             {availableProjects.map((item) => <option key={item.name} value={item.name}>{item.name}{item.source === "template" ? " (template)" : ""}</option>)}
           </select>
-          <button className="btn full" onClick={loadProject} disabled={availableProjects.length === 0}>Load Selected</button>
+          <button className="btn full" onClick={loadProject} disabled={availableProjects.length === 0}>Load Selected (single task)</button>
         </section>
         <section>
           <h2>IMPORT ONNX</h2>
