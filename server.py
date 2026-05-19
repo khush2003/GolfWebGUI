@@ -95,8 +95,22 @@ SUPPORTED_OPS = {
     "Unsqueeze",
     "Reshape",
     "Expand",
+    "OneHot",
+    "MatMul",
+    "MaxPool",
+    "CumSum",
+    "Flatten",
+    "ScatterElements",
+    "ConvTranspose",
+    "GridSample",
+    "GatherElements",
+    "AveragePool",
+    "Gemm",
     "RowIndex",
     "ColIndex",
+    "Split",
+    "TopK",
+    "QLinearMatMul",
 }
 CANVAS_SHAPE = [1, 1, 30, 30]
 TASK_ID_RE = re.compile(r"^task\d{3}$")
@@ -146,6 +160,20 @@ INPUT_SLOT_ORDER = {
     "Unsqueeze": ["input"],
     "Reshape": ["data", "shape"],
     "Expand": ["input", "shape"],
+    "OneHot": ["indices", "depth", "values"],
+    "MatMul": ["a", "b"],
+    "MaxPool": ["input"],
+    "CumSum": ["input", "axis"],
+    "Flatten": ["input"],
+    "ScatterElements": ["data", "indices", "updates"],
+    "ConvTranspose": ["input"],
+    "GridSample": ["input", "grid"],
+    "GatherElements": ["data", "indices"],
+    "AveragePool": ["input"],
+    "Gemm": ["a", "b", "c"],
+    "Split": ["input", "split"],
+    "TopK": ["input", "k"],
+    "QLinearMatMul": ["a", "a_scale", "a_zp", "b", "b_scale", "b_zp", "y_scale", "y_zp"],
 }
 
 app = FastAPI(title="NeuroGolf Lab")
@@ -253,13 +281,17 @@ def _raw_attrs(data: dict[str, Any]) -> dict[str, Any]:
 
 def _shape(data: dict[str, Any] | None, default: list[int] | None = None) -> list[int]:
     data = data or {}
-    raw = data.get("shape") if data.get("shape") not in ("", None) else (default or CANVAS_SHAPE)
+    raw = data.get("shape")
+    if raw == "[]":
+        return []
+    if raw in ("", None):
+        raw = default if default is not None else CANVAS_SHAPE
     raw = _parse_literal(raw)
     if isinstance(raw, int):
         raw = [raw]
     if isinstance(raw, str):
         raw = [int(part.strip()) for part in raw.replace("x", ",").split(",") if part.strip()]
-    if not isinstance(raw, list) or not raw or not all(isinstance(item, int) and item > 0 for item in raw):
+    if not isinstance(raw, list) or not all(isinstance(item, int) and item > 0 for item in raw):
         raise ValueError("All tensors must have statically defined positive integer shapes")
     return raw
 
@@ -268,7 +300,10 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
     if op == "Cast":
         return {"to": int(attrs.get("to", TensorProto.FLOAT))}
     if op == "ArgMax":
-        return {"axis": int(attrs.get("axis", 1)), "keepdims": int(attrs.get("keepdims", 1))}
+        result: dict[str, Any] = {"axis": int(attrs.get("axis", 1)), "keepdims": int(attrs.get("keepdims", 1))}
+        if "select_last_index" in attrs:
+            result["select_last_index"] = int(attrs["select_last_index"])
+        return result
     if op == "ReduceSum":
         return {"keepdims": int(attrs.get("keepdims", 1))}
     if op in {"ReduceMax", "ReduceMin"}:
@@ -297,6 +332,12 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
             result["strides"] = [int(item) for item in attrs["strides"]]
         if "dilations" in attrs:
             result["dilations"] = [int(item) for item in attrs["dilations"]]
+        if "kernel_shape" in attrs:
+            result["kernel_shape"] = [int(item) for item in attrs["kernel_shape"]]
+        if "group" in attrs:
+            result["group"] = int(attrs["group"])
+        if "auto_pad" in attrs:
+            result["auto_pad"] = str(attrs["auto_pad"])
         return result
     if op == "Mod":
         return {"fmod": int(attrs.get("fmod", 0))}
@@ -306,6 +347,103 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
         return {}
     if op == "GatherND":
         return {"batch_dims": int(attrs.get("batch_dims", 0))}
+    if op == "OneHot":
+        return {"axis": int(attrs.get("axis", -1))}
+    if op == "MatMul":
+        return {}
+    if op == "MaxPool":
+        result: dict[str, Any] = {"kernel_shape": [int(item) for item in attrs.get("kernel_shape", [1, 1])]}
+        if "pads" in attrs:
+            result["pads"] = [int(item) for item in attrs["pads"]]
+        if "strides" in attrs:
+            result["strides"] = [int(item) for item in attrs["strides"]]
+        if "dilations" in attrs:
+            result["dilations"] = [int(item) for item in attrs["dilations"]]
+        if "ceil_mode" in attrs:
+            result["ceil_mode"] = int(attrs["ceil_mode"])
+        return result
+    if op == "CumSum":
+        result = {}
+        if "exclusive" in attrs:
+            result["exclusive"] = int(attrs["exclusive"])
+        if "reverse" in attrs:
+            result["reverse"] = int(attrs["reverse"])
+        return result
+    if op == "Flatten":
+        return {"axis": int(attrs.get("axis", 1))}
+    if op == "ScatterElements":
+        result: dict[str, Any] = {"axis": int(attrs.get("axis", 0))}
+        if "reduction" in attrs:
+            result["reduction"] = str(attrs["reduction"])
+        return result
+    if op == "ConvTranspose":
+        result: dict[str, Any] = {}
+        if "pads" in attrs:
+            result["pads"] = [int(item) for item in attrs["pads"]]
+        if "strides" in attrs:
+            result["strides"] = [int(item) for item in attrs["strides"]]
+        if "dilations" in attrs:
+            result["dilations"] = [int(item) for item in attrs["dilations"]]
+        if "kernel_shape" in attrs:
+            result["kernel_shape"] = [int(item) for item in attrs["kernel_shape"]]
+        if "group" in attrs:
+            result["group"] = int(attrs["group"])
+        if "output_padding" in attrs:
+            result["output_padding"] = [int(item) for item in attrs["output_padding"]]
+        if "output_shape" in attrs:
+            result["output_shape"] = [int(item) for item in attrs["output_shape"]]
+        if "auto_pad" in attrs:
+            result["auto_pad"] = str(attrs["auto_pad"])
+        return result
+    if op == "GridSample":
+        result: dict[str, Any] = {}
+        if "align_corners" in attrs:
+            result["align_corners"] = int(attrs["align_corners"])
+        if "mode" in attrs:
+            result["mode"] = str(attrs["mode"])
+        if "padding_mode" in attrs:
+            result["padding_mode"] = str(attrs["padding_mode"])
+        return result
+    if op == "GatherElements":
+        return {"axis": int(attrs.get("axis", 0))}
+    if op == "AveragePool":
+        result: dict[str, Any] = {"kernel_shape": [int(item) for item in attrs.get("kernel_shape", [1, 1])]}
+        if "pads" in attrs:
+            result["pads"] = [int(item) for item in attrs["pads"]]
+        if "strides" in attrs:
+            result["strides"] = [int(item) for item in attrs["strides"]]
+        if "ceil_mode" in attrs:
+            result["ceil_mode"] = int(attrs["ceil_mode"])
+        if "count_include_pad" in attrs:
+            result["count_include_pad"] = int(attrs["count_include_pad"])
+        if "auto_pad" in attrs:
+            result["auto_pad"] = str(attrs["auto_pad"])
+        return result
+    if op == "Gemm":
+        result: dict[str, Any] = {}
+        if "alpha" in attrs:
+            result["alpha"] = float(attrs["alpha"])
+        if "beta" in attrs:
+            result["beta"] = float(attrs["beta"])
+        if "transA" in attrs:
+            result["transA"] = int(attrs["transA"])
+        if "transB" in attrs:
+            result["transB"] = int(attrs["transB"])
+        return result
+    if op == "Split":
+        result: dict[str, Any] = {"axis": int(attrs.get("axis", 0))}
+        if "num_outputs" in attrs:
+            result["num_outputs"] = int(attrs["num_outputs"])
+        return result
+    if op == "TopK":
+        result: dict[str, Any] = {"axis": int(attrs.get("axis", -1))}
+        if "largest" in attrs:
+            result["largest"] = int(attrs["largest"])
+        if "sorted" in attrs:
+            result["sorted"] = int(attrs["sorted"])
+        return result
+    if op == "QLinearMatMul":
+        return {}
     return {}
 
 
@@ -334,7 +472,7 @@ def _output_shape_for_reduction(input_shape: list[int], attrs: dict[str, Any]) -
     axes = [(axis + len(input_shape)) % len(input_shape) for axis in axes]
     if keepdims:
         return [1 if idx in axes else dim for idx, dim in enumerate(input_shape)]
-    return [dim for idx, dim in enumerate(input_shape) if idx not in axes] or [1]
+    return [dim for idx, dim in enumerate(input_shape) if idx not in axes]
 
 
 def _output_shape_for_argmax(input_shape: list[int], attrs: dict[str, Any]) -> list[int]:
@@ -343,7 +481,7 @@ def _output_shape_for_argmax(input_shape: list[int], attrs: dict[str, Any]) -> l
     axis = (axis + len(input_shape)) % len(input_shape)
     if keepdims:
         return [1 if idx == axis else dim for idx, dim in enumerate(input_shape)]
-    return [dim for idx, dim in enumerate(input_shape) if idx != axis] or [1]
+    return [dim for idx, dim in enumerate(input_shape) if idx != axis]
 
 
 def _output_shape_for_slice(input_shape: list[int], attrs: dict[str, Any]) -> list[int]:
@@ -356,12 +494,18 @@ def _output_shape_for_slice(input_shape: list[int], attrs: dict[str, Any]) -> li
     shape = list(input_shape)
     for start, end, axis, step in zip(starts, ends, axes, steps):
         axis = _axis(axis, len(input_shape))
-        if step <= 0:
-            raise ValueError("Slice steps must be positive")
+        if step == 0:
+            raise ValueError("Slice steps must be non-zero")
         dim = input_shape[axis]
-        start = max(0, min(dim, start if start >= 0 else dim + start))
-        end = max(0, min(dim, end if end >= 0 else dim + end))
-        shape[axis] = max(0, (end - start + step - 1) // step)
+        if step > 0:
+            s = max(0, min(dim, start if start >= 0 else dim + start))
+            e = max(0, min(dim, end if end >= 0 else dim + end))
+            new_dim = max(0, (e - s + step - 1) // step)
+        else:
+            s = max(-1, min(dim - 1, start if start >= 0 else dim + start))
+            e = max(-1, min(dim - 1, end if end >= 0 else dim + end))
+            new_dim = max(0, (s - e + (-step) - 1) // (-step))
+        shape[axis] = new_dim
         if shape[axis] <= 0:
             raise ValueError("Slice output dimensions must be positive")
     return shape
@@ -423,9 +567,13 @@ def _output_shape_for_conv(input_shape: list[int], attrs: dict[str, Any], weight
     pads = _int_list(attrs.get("pads"), [0, 0, 0, 0])
     strides = _int_list(attrs.get("strides"), [1, 1])
     dilations = _int_list(attrs.get("dilations"), [1, 1])
-    out_channels, in_channels, kernel_h, kernel_w = weight_shape
-    if input_shape[1] != in_channels:
-        raise ValueError(f"Conv weight input channels {in_channels} do not match tensor channels {input_shape[1]}")
+    group = int(attrs.get("group", 1))
+    out_channels, in_channels_per_group, kernel_h, kernel_w = weight_shape
+    if input_shape[1] != in_channels_per_group * group:
+        raise ValueError(
+            f"Conv weight in_channels*group ({in_channels_per_group}*{group}={in_channels_per_group * group}) "
+            f"do not match input channels {input_shape[1]}"
+        )
     out_h = ((input_shape[2] + pads[0] + pads[2] - dilations[0] * (kernel_h - 1) - 1) // strides[0]) + 1
     out_w = ((input_shape[3] + pads[1] + pads[3] - dilations[1] * (kernel_w - 1) - 1) // strides[1]) + 1
     if out_h <= 0 or out_w <= 0:
@@ -514,7 +662,7 @@ def _topological_sort(by_id: dict[str, dict[str, Any]], incoming: dict[str, list
     return [by_id[node_id] for node_id in ordered_ids]
 
 
-def _incoming_ids(node_id: str, op: str, incoming: dict[str, list[dict[str, Any]]]) -> list[str]:
+def _incoming_ids(node_id: str, op: str, incoming: dict[str, list[dict[str, Any]]]) -> list[tuple[str, int]]:
     slot_order = INPUT_SLOT_ORDER.get(op, [])
     slot_index = {slot: index for index, slot in enumerate(slot_order)}
     seen_slots: set[str] = set()
@@ -543,7 +691,13 @@ def _incoming_ids(node_id: str, op: str, incoming: dict[str, list[dict[str, Any]
             str(edge.get("id") or ""),
         ),
     )
-    return [str(edge["source"]) for edge in edges]
+
+    def _out_idx(edge: dict[str, Any]) -> int:
+        handle = str(edge.get("sourceHandle") or "").strip()
+        match = re.match(r"^out(\d+)$", handle)
+        return int(match.group(1)) if match else 0
+
+    return [(str(edge["source"]), _out_idx(edge)) for edge in edges]
 
 
 def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
@@ -553,7 +707,6 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Not": 1,
         "ArgMax": 1,
         "Transpose": 1,
-        "Resize": 1,
         "Equal": 2,
         "Greater": 2,
         "Less": 2,
@@ -573,7 +726,6 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Abs": 1,
         "Neg": 1,
         "Floor": 1,
-        "Clip": 1,
         "Sign": 1,
         "Sqrt": 1,
         "Gather": 2,
@@ -591,6 +743,22 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Expand": (2, 2),
         "Conv": (1, 3),
         "GatherND": (2, 2),
+        "Clip": (1, 3),
+        "OneHot": (3, 3),
+        "MatMul": (2, 2),
+        "MaxPool": (1, 1),
+        "CumSum": (2, 2),
+        "Flatten": (1, 1),
+        "Resize": (1, 4),
+        "ScatterElements": (3, 3),
+        "ConvTranspose": (1, 3),
+        "GridSample": (2, 2),
+        "GatherElements": (2, 2),
+        "AveragePool": (1, 1),
+        "Gemm": (2, 3),
+        "Split": (1, 2),
+        "TopK": (2, 2),
+        "QLinearMatMul": (8, 8),
     }
     expected = required.get(op)
     if expected is not None and len(ids) != expected:
@@ -638,9 +806,9 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
     onnx_nodes = []
     graph_outputs = []
     graph_inputs = []
-    tensor_name: dict[str, str] = {}
-    tensor_shape: dict[str, list[int]] = {}
-    tensor_type: dict[str, int] = {}
+    tensor_name: dict[tuple[str, int], str] = {}
+    tensor_shape: dict[tuple[str, int], list[int]] = {}
+    tensor_type: dict[tuple[str, int], int] = {}
     constant_values: dict[str, np.ndarray] = {}
 
     for node in sorted_nodes:
@@ -652,19 +820,20 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
 
         if op == "Input":
             shape = _shape(data, CANVAS_SHAPE)
-            tensor_name[node_id] = output_name
-            tensor_shape[node_id] = shape
-            tensor_type[node_id] = TensorProto.FLOAT
+            tensor_name[(node_id, 0)] = output_name
+            tensor_shape[(node_id, 0)] = shape
+            tensor_type[(node_id, 0)] = TensorProto.FLOAT
             graph_inputs.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT, shape))
             continue
 
-        input_ids = _incoming_ids(node_id, op, incoming)
+        input_refs = _incoming_ids(node_id, op, incoming)
+        input_ids = [ref[0] for ref in input_refs]
 
         if op == "Output":
             _expect_inputs(op, node_id, input_ids)
-            source_id = input_ids[0]
-            source_name = tensor_name[source_id]
-            graph_outputs.append(helper.make_tensor_value_info(source_name, tensor_type[source_id], tensor_shape[source_id]))
+            ref = input_refs[0]
+            source_name = tensor_name[ref]
+            graph_outputs.append(helper.make_tensor_value_info(source_name, tensor_type[ref], tensor_shape[ref]))
             continue
 
         if op == "Constant":
@@ -672,9 +841,9 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             array = _constant_array(data, shape)
             tensor = numpy_helper.from_array(array, name=f"{node_id}_value")
             dtype_int = int(tensor.data_type)
-            tensor_name[node_id] = output_name
-            tensor_shape[node_id] = shape
-            tensor_type[node_id] = dtype_int
+            tensor_name[(node_id, 0)] = output_name
+            tensor_shape[(node_id, 0)] = shape
+            tensor_type[(node_id, 0)] = dtype_int
             constant_values[node_id] = array
             onnx_nodes.append(helper.make_node("Constant", inputs=[], outputs=[output_name], name=node_id, value=tensor))
             value_infos.append(helper.make_tensor_value_info(output_name, dtype_int, shape))
@@ -684,21 +853,22 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             shape = _shape(data, CANVAS_SHAPE)
             array = _coordinate_array("row" if op == "RowIndex" else "col", shape)
             tensor = numpy_helper.from_array(array, name=f"{node_id}_value")
-            tensor_name[node_id] = output_name
-            tensor_shape[node_id] = shape
-            tensor_type[node_id] = TensorProto.FLOAT
+            tensor_name[(node_id, 0)] = output_name
+            tensor_shape[(node_id, 0)] = shape
+            tensor_type[(node_id, 0)] = TensorProto.FLOAT
             onnx_nodes.append(helper.make_node("Constant", inputs=[], outputs=[output_name], name=node_id, value=tensor))
             value_infos.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT, shape))
             continue
 
         _expect_inputs(op, node_id, input_ids)
-        inputs = [tensor_name[source_id] for source_id in input_ids]
-        input_shapes = [tensor_shape[source_id] for source_id in input_ids]
-        input_types = [tensor_type[source_id] for source_id in input_ids]
+        inputs = [tensor_name[ref] for ref in input_refs]
+        input_shapes = [tensor_shape[ref] for ref in input_refs]
+        input_types = [tensor_type[ref] for ref in input_refs]
         shape = _shape(data, input_shapes[0])
         out_type = input_types[0]
         node_inputs = inputs
         node_attrs_override: dict[str, Any] | None = None
+        extra_outputs: list[tuple[str, list[int], int]] = []
 
         same_shape_ops = {
             "Equal",
@@ -752,17 +922,23 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                     node_inputs = [inputs[0], axes_name]
                 shape = _output_shape_for_reduction(input_shapes[0], attrs)
         elif op == "Clip":
-            if "min" in attrs or "max" in attrs:
+            if len(input_ids) >= 2:
+                node_inputs = list(inputs)
+            elif "min" in attrs or "max" in attrs:
                 node_inputs = [inputs[0]]
+                in_dtype = input_types[0]
+                np_dtype = _np_dtype_for_tensor_proto(in_dtype)
                 if "min" in attrs:
                     min_name = f"{node_id}_min"
-                    initializers.append(helper.make_tensor(min_name, TensorProto.FLOAT, [], [float(attrs["min"])]))
+                    min_arr = np.array(attrs["min"], dtype=np_dtype)
+                    initializers.append(numpy_helper.from_array(min_arr, name=min_name))
                     node_inputs.append(min_name)
                 elif "max" in attrs:
                     node_inputs.append("")
                 if "max" in attrs:
                     max_name = f"{node_id}_max"
-                    initializers.append(helper.make_tensor(max_name, TensorProto.FLOAT, [], [float(attrs["max"])]))
+                    max_arr = np.array(attrs["max"], dtype=np_dtype)
+                    initializers.append(numpy_helper.from_array(max_arr, name=max_name))
                     node_inputs.append(max_name)
         elif op == "ArgMax":
             shape = _output_shape_for_argmax(input_shapes[0], attrs)
@@ -780,22 +956,26 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                     initializers.append(helper.make_tensor(initializer_name, TensorProto.INT64, [len(values)], [int(item) for item in values]))
                     node_inputs.append(initializer_name)
             else:
-                for idx, role in enumerate(("starts", "ends", "axes", "steps"), start=1):
-                    if idx < len(input_ids) and input_ids[idx] not in constant_values:
-                        raise ValueError(f"Slice node {node_id!r} expects its {role} input to be a Constant")
-                starts = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
-                ends = [int(item) for item in constant_values[input_ids[2]].reshape(-1).tolist()]
-                axes = (
-                    [int(item) for item in constant_values[input_ids[3]].reshape(-1).tolist()]
-                    if len(input_ids) >= 4
-                    else list(range(len(starts)))
+                dyn = any(
+                    idx < len(input_ids) and input_ids[idx] not in constant_values
+                    for idx in range(1, min(5, len(input_ids)))
                 )
-                steps = (
-                    [int(item) for item in constant_values[input_ids[4]].reshape(-1).tolist()]
-                    if len(input_ids) >= 5
-                    else [1 for _ in starts]
-                )
-                shape = _output_shape_for_slice(input_shapes[0], {"starts": starts, "ends": ends, "axes": axes, "steps": steps})
+                if dyn:
+                    shape = list(input_shapes[0])
+                else:
+                    starts = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                    ends = [int(item) for item in constant_values[input_ids[2]].reshape(-1).tolist()]
+                    axes = (
+                        [int(item) for item in constant_values[input_ids[3]].reshape(-1).tolist()]
+                        if len(input_ids) >= 4
+                        else list(range(len(starts)))
+                    )
+                    steps = (
+                        [int(item) for item in constant_values[input_ids[4]].reshape(-1).tolist()]
+                        if len(input_ids) >= 5
+                        else [1 for _ in starts]
+                    )
+                    shape = _output_shape_for_slice(input_shapes[0], {"starts": starts, "ends": ends, "axes": axes, "steps": steps})
                 node_inputs = list(inputs)
         elif op == "Pad":
             if len(input_ids) == 1:
@@ -803,8 +983,10 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                 shape = _output_shape_for_pad(input_shapes[0], {"pads": pads})
                 pads_name = f"{node_id}_pads"
                 value_name = f"{node_id}_constant_value"
+                in_dtype = input_types[0]
                 initializers.append(helper.make_tensor(pads_name, TensorProto.INT64, [len(pads)], [int(item) for item in pads]))
-                initializers.append(helper.make_tensor(value_name, TensorProto.FLOAT, [], [float(attrs.get("value", 0))]))
+                np_value = np.array(attrs.get("value", 0), dtype=_np_dtype_for_tensor_proto(in_dtype))
+                initializers.append(numpy_helper.from_array(np_value, name=value_name))
                 node_inputs = [inputs[0], pads_name, value_name]
             else:
                 if input_ids[1] not in constant_values:
@@ -830,25 +1012,56 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                 shape = _output_shape_for_tile(input_shapes[0], {"repeats": repeats})
                 node_inputs = list(inputs)
         elif op == "Resize":
-            shape = _output_shape_for_resize(input_shapes[0], attrs)
-            roi_name = f"{node_id}_roi"
-            scales_name = f"{node_id}_scales"
-            sizes_name = f"{node_id}_sizes"
-            initializers.append(helper.make_tensor(roi_name, TensorProto.FLOAT, [0], []))
-            initializers.append(helper.make_tensor(scales_name, TensorProto.FLOAT, [0], []))
-            initializers.append(helper.make_tensor(sizes_name, TensorProto.INT64, [len(shape)], [int(item) for item in shape]))
-            node_inputs = [inputs[0], roi_name, scales_name, sizes_name]
+            if len(input_ids) >= 2:
+                sizes = None
+                scales = None
+                if len(input_ids) >= 4 and input_ids[3] in constant_values:
+                    sizes = [int(item) for item in constant_values[input_ids[3]].reshape(-1).tolist()]
+                if scales is None and len(input_ids) >= 3 and input_ids[2] in constant_values:
+                    raw = constant_values[input_ids[2]].reshape(-1).tolist()
+                    if raw:
+                        scales = [float(item) for item in raw]
+                if len(input_ids) == 2 and input_ids[1] in constant_values:
+                    arr = constant_values[input_ids[1]]
+                    raw = arr.reshape(-1).tolist()
+                    if raw:
+                        if np.issubdtype(arr.dtype, np.floating):
+                            scales = [float(item) for item in raw]
+                        else:
+                            sizes = [int(item) for item in raw]
+                if sizes is not None and any(s > 0 for s in sizes):
+                    shape = sizes
+                elif scales is not None and len(scales) == len(input_shapes[0]):
+                    shape = [max(1, int(round(d * s))) for d, s in zip(input_shapes[0], scales)]
+                else:
+                    shape = _output_shape_for_resize(input_shapes[0], attrs)
+                if len(input_ids) == 2:
+                    roi_name = f"{node_id}_roi"
+                    initializers.append(helper.make_tensor(roi_name, TensorProto.FLOAT, [0], []))
+                    if scales is not None:
+                        node_inputs = [inputs[0], roi_name, inputs[1]]
+                    else:
+                        scales_name = f"{node_id}_scales"
+                        initializers.append(helper.make_tensor(scales_name, TensorProto.FLOAT, [0], []))
+                        node_inputs = [inputs[0], roi_name, scales_name, inputs[1]]
+                else:
+                    node_inputs = list(inputs)
+            else:
+                shape = _output_shape_for_resize(input_shapes[0], attrs)
+                roi_name = f"{node_id}_roi"
+                scales_name = f"{node_id}_scales"
+                sizes_name = f"{node_id}_sizes"
+                initializers.append(helper.make_tensor(roi_name, TensorProto.FLOAT, [0], []))
+                initializers.append(helper.make_tensor(scales_name, TensorProto.FLOAT, [0], []))
+                initializers.append(helper.make_tensor(sizes_name, TensorProto.INT64, [len(shape)], [int(item) for item in shape]))
+                node_inputs = [inputs[0], roi_name, scales_name, sizes_name]
         elif op == "Conv":
             if len(input_ids) >= 2:
-                if input_ids[1] not in constant_values:
-                    raise ValueError(f"Conv node {node_id!r} expects weights input to be a Constant")
-                weight_array = constant_values[input_ids[1]]
-                weight_shape = list(weight_array.shape)
-                node_inputs = [inputs[0], inputs[1]]
-                if len(input_ids) >= 3:
-                    if input_ids[2] not in constant_values:
-                        raise ValueError(f"Conv node {node_id!r} expects bias input to be a Constant")
-                    node_inputs.append(inputs[2])
+                if input_ids[1] in constant_values:
+                    weight_shape = list(constant_values[input_ids[1]].shape)
+                else:
+                    weight_shape = list(input_shapes[1])
+                node_inputs = list(inputs)
             else:
                 weights = attrs.get("weights", attrs.get("kernel", [1]))
                 weight_shape = _shape({"shape": attrs.get("weight_shape", attrs.get("kernel_shape", [1, input_shapes[0][1], 1, 1]))})
@@ -881,13 +1094,15 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                     axes_list = [int(item) for item in raw_axes]
                 else:
                     axes_list = []
+                if axes_list:
+                    axes_name = f"{node_id}_axes"
+                    initializers.append(helper.make_tensor(axes_name, TensorProto.INT64, [len(axes_list)], axes_list))
+                    node_inputs = [inputs[0], axes_name]
             if axes_list:
                 normalized = sorted({(a + len(in_shape)) % len(in_shape) for a in axes_list})
                 shape = [d for i, d in enumerate(in_shape) if i not in normalized]
             else:
                 shape = [d for d in in_shape if d != 1]
-            if not shape:
-                shape = [1]
         elif op == "Unsqueeze":
             in_shape = list(input_shapes[0])
             if len(input_ids) >= 2:
@@ -903,8 +1118,11 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                     axes_list = [int(item) for item in raw_axes]
                 else:
                     axes_list = []
-            if not axes_list:
-                raise ValueError(f"Unsqueeze node {node_id!r} requires axes")
+                if not axes_list:
+                    raise ValueError(f"Unsqueeze node {node_id!r} requires axes")
+                axes_name = f"{node_id}_axes"
+                initializers.append(helper.make_tensor(axes_name, TensorProto.INT64, [len(axes_list)], axes_list))
+                node_inputs = [inputs[0], axes_name]
             out_rank = len(in_shape) + len(axes_list)
             normalized = sorted({(a + out_rank) % out_rank for a in axes_list})
             shape = list(in_shape)
@@ -963,12 +1181,223 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             actual_axis = (axis + len(data_shape)) % len(data_shape)
             shape = data_shape[:actual_axis] + indices_shape + data_shape[actual_axis + 1:]
             out_type = input_types[0]
+        elif op == "OneHot":
+            if input_ids[1] not in constant_values:
+                raise ValueError(f"OneHot node {node_id!r} expects depth input to be a Constant")
+            depth_arr = constant_values[input_ids[1]].reshape(-1).tolist()
+            depth = int(depth_arr[0])
+            axis = int(attrs.get("axis", -1))
+            in_shape = list(input_shapes[0])
+            insert_at = (axis + len(in_shape) + 1) % (len(in_shape) + 1)
+            shape = in_shape[:insert_at] + [depth] + in_shape[insert_at:]
+            out_type = input_types[2]
+            node_inputs = list(inputs)
+        elif op == "MatMul":
+            a_shape = list(input_shapes[0])
+            b_shape = list(input_shapes[1])
+            if len(a_shape) >= 2 and len(b_shape) >= 2:
+                m, k1 = a_shape[-2], a_shape[-1]
+                k2, n = b_shape[-2], b_shape[-1]
+                if k1 != k2:
+                    raise ValueError(f"MatMul node {node_id!r} inner dims mismatch: {k1} vs {k2}")
+                a_batch = a_shape[:-2] or [1]
+                b_batch = b_shape[:-2] or [1]
+                batch_shape = _broadcast_shapes([a_batch, b_batch])
+                shape = (batch_shape if (a_shape[:-2] or b_shape[:-2]) else []) + [m, n]
+            elif len(a_shape) == 1 and len(b_shape) == 1:
+                shape = [1]
+            elif len(a_shape) == 1:
+                shape = list(b_shape[:-2]) + [b_shape[-1]]
+            elif len(b_shape) == 1:
+                shape = list(a_shape[:-1])
+            else:
+                raise ValueError(f"MatMul node {node_id!r}: cannot infer shape for {a_shape} x {b_shape}")
+        elif op == "MaxPool":
+            kernel = _int_list(attrs.get("kernel_shape"), [1, 1])
+            pads = _int_list(attrs.get("pads"), [0] * (2 * len(kernel)))
+            strides = _int_list(attrs.get("strides"), [1 for _ in kernel])
+            dilations = _int_list(attrs.get("dilations"), [1 for _ in kernel])
+            in_shape = list(input_shapes[0])
+            if len(in_shape) != 4 or len(kernel) != 2:
+                raise ValueError(f"MaxPool node {node_id!r} requires NCHW input and 2D kernel")
+            ceil_mode = int(attrs.get("ceil_mode", 0))
+            def _pool_dim(d, p_lo, p_hi, k, s, dil):
+                num = d + p_lo + p_hi - dil * (k - 1) - 1
+                if ceil_mode:
+                    return -(-num // s) + 1
+                return num // s + 1
+            out_h = _pool_dim(in_shape[2], pads[0], pads[2], kernel[0], strides[0], dilations[0])
+            out_w = _pool_dim(in_shape[3], pads[1], pads[3], kernel[1], strides[1], dilations[1])
+            shape = [in_shape[0], in_shape[1], out_h, out_w]
+        elif op == "CumSum":
+            shape = list(input_shapes[0])
+            node_inputs = list(inputs)
+        elif op == "Flatten":
+            axis = int(attrs.get("axis", 1))
+            in_shape = list(input_shapes[0])
+            actual_axis = (axis + len(in_shape)) % len(in_shape) if in_shape else 0
+            pre = 1
+            for d in in_shape[:actual_axis]:
+                pre *= d
+            post = 1
+            for d in in_shape[actual_axis:]:
+                post *= d
+            shape = [pre, post]
+        elif op == "ScatterElements":
+            shape = list(input_shapes[0])
+            node_inputs = list(inputs)
+        elif op == "GridSample":
+            in_shape = list(input_shapes[0])
+            grid_shape = list(input_shapes[1])
+            if len(in_shape) == 4 and len(grid_shape) == 4:
+                shape = [in_shape[0], in_shape[1], grid_shape[1], grid_shape[2]]
+            elif len(in_shape) == 5 and len(grid_shape) == 5:
+                shape = [in_shape[0], in_shape[1], grid_shape[1], grid_shape[2], grid_shape[3]]
+            else:
+                raise ValueError(f"GridSample node {node_id!r}: unsupported ranks {len(in_shape)}/{len(grid_shape)}")
+            node_inputs = list(inputs)
+        elif op == "GatherElements":
+            shape = list(input_shapes[1])
+            node_inputs = list(inputs)
+        elif op == "AveragePool":
+            kernel = _int_list(attrs.get("kernel_shape"), [1, 1])
+            pads = _int_list(attrs.get("pads"), [0] * (2 * len(kernel)))
+            strides = _int_list(attrs.get("strides"), [1 for _ in kernel])
+            in_shape = list(input_shapes[0])
+            if len(in_shape) != 4 or len(kernel) != 2:
+                raise ValueError(f"AveragePool node {node_id!r} requires NCHW input and 2D kernel")
+            ceil_mode = int(attrs.get("ceil_mode", 0))
+            def _avgpool_dim(d, p_lo, p_hi, k, s):
+                num = d + p_lo + p_hi - k
+                if ceil_mode:
+                    return -(-num // s) + 1
+                return num // s + 1
+            out_h = _avgpool_dim(in_shape[2], pads[0], pads[2], kernel[0], strides[0])
+            out_w = _avgpool_dim(in_shape[3], pads[1], pads[3], kernel[1], strides[1])
+            shape = [in_shape[0], in_shape[1], out_h, out_w]
+        elif op == "Gemm":
+            a_shape = list(input_shapes[0])
+            b_shape = list(input_shapes[1])
+            trans_a = int(attrs.get("transA", 0))
+            trans_b = int(attrs.get("transB", 0))
+            m_dim = a_shape[1] if trans_a else a_shape[0]
+            n_dim = b_shape[0] if trans_b else b_shape[1]
+            shape = [m_dim, n_dim]
+            node_inputs = list(inputs)
+        elif op == "ConvTranspose":
+            in_shape = list(input_shapes[0])
+            if len(input_ids) >= 2:
+                if input_ids[1] in constant_values:
+                    weight_shape = list(constant_values[input_ids[1]].shape)
+                else:
+                    weight_shape = list(input_shapes[1])
+                node_inputs = list(inputs)
+            else:
+                raise ValueError(f"ConvTranspose node {node_id!r} requires a weight input")
+            group = int(attrs.get("group", 1))
+            kernel = _int_list(attrs.get("kernel_shape"), list(weight_shape[2:]))
+            strides = _int_list(attrs.get("strides"), [1 for _ in kernel])
+            pads = _int_list(attrs.get("pads"), [0] * (2 * len(kernel)))
+            dilations = _int_list(attrs.get("dilations"), [1 for _ in kernel])
+            output_padding = _int_list(attrs.get("output_padding"), [0 for _ in kernel])
+            out_channels = weight_shape[1] * group
+            spatial = []
+            for i, k in enumerate(kernel):
+                in_d = in_shape[2 + i]
+                p_lo = pads[i]
+                p_hi = pads[i + len(kernel)]
+                out_d = strides[i] * (in_d - 1) + output_padding[i] + ((k - 1) * dilations[i] + 1) - p_lo - p_hi
+                spatial.append(out_d)
+            shape = [in_shape[0], out_channels] + spatial
+        elif op == "Split":
+            in_shape = list(input_shapes[0])
+            axis = int(attrs.get("axis", 0))
+            actual_axis = (axis + len(in_shape)) % len(in_shape) if in_shape else 0
+            split_sizes: list[int] | None = None
+            if len(input_ids) >= 2:
+                if input_ids[1] in constant_values:
+                    split_sizes = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                else:
+                    raise ValueError(f"Split node {node_id!r} expects its split input to be a Constant")
+                node_inputs = list(inputs)
+            elif "split" in attrs and attrs["split"] is not None:
+                raw_split = attrs["split"]
+                split_sizes = [int(raw_split)] if isinstance(raw_split, int) else [int(item) for item in raw_split]
+                split_name = f"{node_id}_split"
+                initializers.append(helper.make_tensor(split_name, TensorProto.INT64, [len(split_sizes)], split_sizes))
+                node_inputs = [inputs[0], split_name]
+            num_outputs_hint = data.get("outputCount")
+            if num_outputs_hint is None and "num_outputs" in attrs:
+                num_outputs_hint = attrs["num_outputs"]
+            if split_sizes is None:
+                if num_outputs_hint is None:
+                    raise ValueError(f"Split node {node_id!r} requires split sizes or outputCount")
+                num_outputs = int(num_outputs_hint)
+                axis_dim = in_shape[actual_axis]
+                base = axis_dim // num_outputs
+                remainder = axis_dim - base * num_outputs
+                split_sizes = [base + (1 if i < remainder else 0) for i in range(num_outputs)]
+            num_outputs = len(split_sizes)
+            shape = list(in_shape)
+            shape[actual_axis] = split_sizes[0]
+            for i in range(1, num_outputs):
+                extra_shape = list(in_shape)
+                extra_shape[actual_axis] = split_sizes[i]
+                extra_outputs.append((f"{node_id}_out_{i}", extra_shape, input_types[0]))
+            node_attrs_override = {"axis": axis}
+        elif op == "TopK":
+            in_shape = list(input_shapes[0])
+            axis = int(attrs.get("axis", -1))
+            actual_axis = (axis + len(in_shape)) % len(in_shape) if in_shape else 0
+            if len(input_ids) < 2 or input_ids[1] not in constant_values:
+                raise ValueError(f"TopK node {node_id!r} expects its K input to be a Constant")
+            k_arr = constant_values[input_ids[1]].reshape(-1)
+            k_val = int(k_arr[0])
+            shape = list(in_shape)
+            shape[actual_axis] = k_val
+            extra_outputs.append((f"{node_id}_out_1", list(shape), TensorProto.INT64))
+            node_inputs = list(inputs)
+            override: dict[str, Any] = {"axis": axis}
+            if "largest" in attrs:
+                override["largest"] = int(attrs["largest"])
+            if "sorted" in attrs:
+                override["sorted"] = int(attrs["sorted"])
+            node_attrs_override = override
+        elif op == "QLinearMatMul":
+            a_shape = list(input_shapes[0])
+            b_shape = list(input_shapes[3])
+            if len(a_shape) >= 2 and len(b_shape) >= 2:
+                m, k1 = a_shape[-2], a_shape[-1]
+                k2, n = b_shape[-2], b_shape[-1]
+                if k1 != k2:
+                    raise ValueError(f"QLinearMatMul node {node_id!r} inner dims mismatch: {k1} vs {k2}")
+                a_batch = a_shape[:-2] or [1]
+                b_batch = b_shape[:-2] or [1]
+                batch_shape = _broadcast_shapes([a_batch, b_batch])
+                shape = (batch_shape if (a_shape[:-2] or b_shape[:-2]) else []) + [m, n]
+            elif len(a_shape) == 1 and len(b_shape) == 1:
+                shape = [1]
+            elif len(a_shape) == 1:
+                shape = list(b_shape[:-2]) + [b_shape[-1]]
+            elif len(b_shape) == 1:
+                shape = list(a_shape[:-1])
+            else:
+                raise ValueError(f"QLinearMatMul node {node_id!r}: cannot infer shape for {a_shape} x {b_shape}")
+            out_type = input_types[0]
+            node_inputs = list(inputs)
 
-        tensor_name[node_id] = output_name
-        tensor_shape[node_id] = shape
-        tensor_type[node_id] = out_type
+        tensor_name[(node_id, 0)] = output_name
+        tensor_shape[(node_id, 0)] = shape
+        tensor_type[(node_id, 0)] = out_type
+        output_names = [output_name]
+        for extra_idx, (extra_name, extra_shape, extra_type) in enumerate(extra_outputs, start=1):
+            tensor_name[(node_id, extra_idx)] = extra_name
+            tensor_shape[(node_id, extra_idx)] = extra_shape
+            tensor_type[(node_id, extra_idx)] = extra_type
+            output_names.append(extra_name)
+            value_infos.append(helper.make_tensor_value_info(extra_name, extra_type, extra_shape))
         final_attrs = node_attrs_override if node_attrs_override is not None else _onnx_attrs(op, attrs)
-        onnx_nodes.append(helper.make_node(op, inputs=node_inputs, outputs=[output_name], name=node_id, **final_attrs))
+        onnx_nodes.append(helper.make_node(op, inputs=node_inputs, outputs=output_names, name=node_id, **final_attrs))
         value_infos.append(helper.make_tensor_value_info(output_name, out_type, shape))
 
     if not graph_outputs:
@@ -1010,10 +1439,13 @@ def _try_load_imported_model(payload: ExportPayload) -> onnx.ModelProto | None:
 
 
 def _compile_or_fallback(payload: ExportPayload) -> tuple[onnx.ModelProto, str, str | None]:
-    imported = _try_load_imported_model(payload)
-    if imported is not None:
-        return imported, "imported", None
-    return compile_graph(payload), "compiled", None
+    try:
+        return compile_graph(payload), "compiled", None
+    except Exception as compile_exc:
+        imported = _try_load_imported_model(payload)
+        if imported is not None:
+            return imported, "imported-fallback", f"{type(compile_exc).__name__}: {compile_exc}"
+        raise
 
 
 def _dim_value(dim: onnx.TensorShapeProto.Dimension) -> int | str | None:
@@ -1180,7 +1612,7 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
     model = onnx.load(path)
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
-    producers: dict[str, str] = {}
+    producers: dict[str, tuple[str, int]] = {}
     occupied_ids: set[str] = set()
 
     def unique_id(raw: str, fallback: str) -> str:
@@ -1221,13 +1653,16 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
                 "inputSlots": [],
             },
         )
-        producers[value_info.name] = node_id
+        producers[value_info.name] = (node_id, 0)
         index += 1
 
     for initializer in model.graph.initializer:
         array = numpy_helper.to_array(initializer)
         flat = array.reshape(-1).tolist()
-        shape_str = ",".join(str(item) for item in array.shape) or "1"
+        if array.ndim == 0:
+            shape_str = "[]"
+        else:
+            shape_str = ",".join(str(item) for item in array.shape) or "1"
         node_id = add_node(
             initializer.name,
             f"init_{index}",
@@ -1247,7 +1682,7 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
                 },
             },
         )
-        producers[initializer.name] = node_id
+        producers[initializer.name] = (node_id, 0)
         index += 1
 
     for node_index, onnx_node in enumerate(model.graph.node, start=1):
@@ -1257,12 +1692,17 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
             "inputSlots": slots,
             "attrs": _onnx_attrs_for_gui(onnx_node),
         }
+        if len(onnx_node.output) > 1:
+            node_data["outputCount"] = len(onnx_node.output)
         if onnx_node.op_type == "Constant":
             for attr in onnx_node.attribute:
                 if attr.name == "value":
                     tensor_proto = helper.get_attribute_value(attr)
                     arr = numpy_helper.to_array(tensor_proto)
-                    node_data["shape"] = ",".join(str(item) for item in arr.shape) or "1"
+                    if arr.ndim == 0:
+                        node_data["shape"] = "[]"
+                    else:
+                        node_data["shape"] = ",".join(str(item) for item in arr.shape) or "1"
                     node_data["dataType"] = int(tensor_proto.data_type)
                     node_data["values"] = arr.reshape(-1).tolist()
                     break
@@ -1278,22 +1718,24 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
         for input_index, input_name in enumerate(onnx_node.input):
             if not input_name:
                 continue
-            source_id = producers.get(input_name)
-            if source_id:
+            producer_info = producers.get(input_name)
+            if producer_info:
+                source_id, src_out_idx = producer_info
                 slot = f"in{visible_slot}"
-                edges.append(
-                    {
-                        "id": f"e_{len(edges) + 1}",
-                        "source": source_id,
-                        "target": node_id,
-                        "targetHandle": slot,
-                        "data": {"tensor": input_name, "inputIndex": input_index},
-                    }
-                )
+                edge = {
+                    "id": f"e_{len(edges) + 1}",
+                    "source": source_id,
+                    "target": node_id,
+                    "targetHandle": slot,
+                    "data": {"tensor": input_name, "inputIndex": input_index},
+                }
+                if src_out_idx > 0:
+                    edge["sourceHandle"] = f"out{src_out_idx}"
+                edges.append(edge)
             visible_slot += 1
-        for output_name in onnx_node.output:
+        for out_idx, output_name in enumerate(onnx_node.output):
             if output_name:
-                producers[output_name] = node_id
+                producers[output_name] = (node_id, out_idx)
 
     for output_index, output in enumerate(model.graph.output, start=1):
         node_id = add_node(
@@ -1308,17 +1750,19 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
             },
         )
         index += 1
-        source_id = producers.get(output.name)
-        if source_id:
-            edges.append(
-                {
-                    "id": f"e_{len(edges) + 1}",
-                    "source": source_id,
-                    "target": node_id,
-                    "targetHandle": "input",
-                    "data": {"tensor": output.name},
-                }
-            )
+        producer_info = producers.get(output.name)
+        if producer_info:
+            source_id, src_out_idx = producer_info
+            edge = {
+                "id": f"e_{len(edges) + 1}",
+                "source": source_id,
+                "target": node_id,
+                "targetHandle": "input",
+                "data": {"tensor": output.name},
+            }
+            if src_out_idx > 0:
+                edge["sourceHandle"] = f"out{src_out_idx}"
+            edges.append(edge)
 
     positions = _layout_positions(nodes, edges)
     for node in nodes:
