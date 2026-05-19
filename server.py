@@ -1413,6 +1413,20 @@ def _run_session(session: ort.InferenceSession, source_grid: Any) -> tuple[np.nd
     return session.run(None, feed)[0], region
 
 
+def _detect_output_region(decoded: np.ndarray, fallback: tuple[int, int]) -> tuple[int, int]:
+    arr = np.asarray(decoded)
+    while arr.ndim > 2 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return fallback
+    nonzero = np.argwhere(arr != 0)
+    if nonzero.size == 0:
+        return fallback
+    rmax = int(nonzero[:, 0].max()) + 1
+    cmax = int(nonzero[:, 1].max()) + 1
+    return (rmax, cmax)
+
+
 def _tensor_to_grid(tensor: np.ndarray, region: tuple[int, int]) -> list[list[int | float | bool]]:
     array = np.asarray(tensor)
     if array.ndim >= 4:
@@ -1511,15 +1525,16 @@ def run_onnx(payload: RunPayload):
         if source_grid is None:
             raise ValueError("Run input grid is missing")
         session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
-        raw_actual, region = _run_session(session, source_grid)
+        raw_actual, input_region = _run_session(session, source_grid)
         actual = _decode_model_output(raw_actual)
         _assert_color_bounds("Run", actual)
+        out_region = _detect_output_region(actual, input_region)
         return {
             "status": "ran",
             "source": source,
             "taskId": _task_id(payload),
             "shape": list(actual.shape),
-            "grid": _tensor_to_grid(actual, region),
+            "grid": _tensor_to_grid(actual, out_region),
             "io": _model_summary(model),
         }
     except ValidationError as exc:
