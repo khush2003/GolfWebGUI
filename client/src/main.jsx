@@ -9,6 +9,7 @@ import "./style.css";
 const arcColors = ["#000000", "#0074D9", "#FF4136", "#2ECC40", "#FFDC00", "#AAAAAA", "#F012BE", "#FF851B", "#7FDBFF", "#870C25"];
 const baseOps = ["Input", "Output", "Constant", "RowIndex", "ColIndex", "Cast", "Identity", "Equal", "Greater", "Less", "GreaterOrEqual", "LessOrEqual", "Not", "And", "Or", "Xor", "Add", "Sub", "Mul", "Div", "Mod", "Min", "Max", "Sum", "Relu", "Abs", "Neg", "Floor", "Clip", "Sign", "Sqrt", "ReduceSum", "ReduceMax", "ReduceMin", "ArgMax", "Where", "Slice", "Pad", "Concat", "Transpose", "Tile", "Resize", "Conv"];
 const PROJECT_STORAGE_KEY = "neurogolf-projects-v1";
+const GRAPHS_STORAGE_KEY = "neurogolf-task-graphs-v1";
 const TASK_COUNT = 400;
 const TASK_PAGE_SIZE = 40;
 const inputSlots = {
@@ -166,6 +167,31 @@ function loadStoredProjects() {
 
 function persistStoredProjects(projects) {
   window.localStorage.setItem(PROJECT_STORAGE_KEY, JSON.stringify(projects));
+}
+
+function loadStoredGraphs() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(GRAPHS_STORAGE_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object") return {};
+    const cleaned = {};
+    for (const [taskId, entry] of Object.entries(parsed)) {
+      if (entry && Array.isArray(entry.nodes) && Array.isArray(entry.edges)) {
+        cleaned[taskId] = {
+          nodes: entry.nodes,
+          edges: entry.edges,
+          projectName: entry.projectName || `neurogolf-${taskId}`,
+          savedAt: entry.savedAt || null,
+        };
+      }
+    }
+    return cleaned;
+  } catch {
+    return {};
+  }
+}
+
+function persistStoredGraphs(graphs) {
+  window.localStorage.setItem(GRAPHS_STORAGE_KEY, JSON.stringify(graphs));
 }
 
 function OpNode({ data, selected }) {
@@ -359,6 +385,8 @@ function App() {
   const [task, setTask] = useState(10);
   const [projectName, setProjectName] = useState("neurogolf-task010");
   const [storedProjects, setStoredProjects] = useState(() => loadStoredProjects());
+  const [graphsByTask, setGraphsByTask] = useState(() => loadStoredGraphs());
+  const graphsByTaskRef = useRef({});
   const [bestManifest, setBestManifest] = useState(null);
   const [bestLoadState, setBestLoadState] = useState("loading");
   const [selectedProjectName, setSelectedProjectName] = useState("baseline-cast-equal");
@@ -381,7 +409,9 @@ function App() {
   const [lastDownload, setLastDownload] = useState({ state: "idle" });
   const [lastImport, setLastImport] = useState({ state: "idle" });
   const [importedTasks, setImportedTasks] = useState(() => new Set());
+  const importedTasksRef = useRef(new Set());
   const importInputRef = useRef(null);
+  const prevTaskIdRef = useRef(null);
   const exampleSets = useMemo(() => ({
     train: currentTask?.train || [],
     test: currentTask?.test || [],
@@ -460,6 +490,45 @@ function App() {
   }, [taskId]);
 
   useEffect(() => {
+    graphsByTaskRef.current = graphsByTask;
+  }, [graphsByTask]);
+
+  useEffect(() => {
+    importedTasksRef.current = importedTasks;
+  }, [importedTasks]);
+
+  useEffect(() => {
+    const prev = prevTaskIdRef.current;
+    if (prev === taskId) return;
+    if (prev) {
+      const snapshot = {
+        nodes: cloneGraph(nodes),
+        edges: cloneGraph(edges),
+        projectName,
+      };
+      const merged = { ...graphsByTaskRef.current, [prev]: { ...graphsByTaskRef.current[prev], ...snapshot } };
+      graphsByTaskRef.current = merged;
+      setGraphsByTask(merged);
+    }
+    const next = graphsByTaskRef.current[taskId];
+    if (next) {
+      setNodes(cloneGraph(next.nodes));
+      setEdges(cloneGraph(next.edges));
+      setProjectName(next.projectName || `neurogolf-${taskId}`);
+    } else {
+      setNodes(cloneGraph(defaultNodes()));
+      setEdges(cloneGraph(defaultEdges()));
+      setProjectName(`neurogolf-${taskId}`);
+      if (importedTasksRef.current.has(taskId)) {
+        applyGraphFromBest(taskId);
+      }
+    }
+    resetTransientGraphState();
+    scheduleFitView();
+    prevTaskIdRef.current = taskId;
+  }, [taskId]);
+
+  useEffect(() => {
     let cancelled = false;
     fetch("/best/manifest.json", { cache: "no-cache" })
       .then((response) => {
@@ -530,25 +599,28 @@ function App() {
   };
 
   const saveProject = () => {
-    const name = projectName.trim();
-    if (!name) {
-      setStatus("Project name is required before save");
-      return;
-    }
-    const snapshot = {
-      name,
-      taskId,
-      savedAt: new Date().toISOString(),
-      nodes: cloneGraph(nodes),
-      edges: cloneGraph(edges),
+    const name = projectName.trim() || `neurogolf-${taskId}`;
+    const savedAt = new Date().toISOString();
+    const merged = {
+      ...graphsByTaskRef.current,
+      [taskId]: {
+        nodes: cloneGraph(nodes),
+        edges: cloneGraph(edges),
+        projectName: name,
+        savedAt,
+      },
     };
+    graphsByTaskRef.current = merged;
+    setGraphsByTask(merged);
+    persistStoredGraphs(merged);
     setStoredProjects((current) => {
-      const next = [snapshot, ...current.filter((project) => project.name !== name)];
+      const named = { name, taskId, savedAt, nodes: cloneGraph(nodes), edges: cloneGraph(edges) };
+      const next = [named, ...current.filter((project) => project.name !== name)];
       persistStoredProjects(next);
       return next;
     });
     setSelectedProjectName(name);
-    setStatus(`Saved project ${name}`);
+    setStatus(`Saved ${Object.keys(merged).length} task graph(s) (active: ${taskId})`);
   };
 
   const loadProject = () => {
@@ -557,25 +629,50 @@ function App() {
       setStatus("Select a saved project to load");
       return;
     }
-    const nextTask = Number(project.taskId?.replace("task", "")) || task;
-    setTask(clampTask(nextTask));
-    setProjectName(project.name);
-    setNodes(cloneGraph(project.nodes));
-    setEdges(cloneGraph(project.edges));
-    resetTransientGraphState();
-    setStatus(`Loaded project ${project.name}`);
-    scheduleFitView();
+    const nextTask = clampTask(Number(project.taskId?.replace("task", "")) || task);
+    const targetId = taskIdFor(nextTask);
+    const entry = {
+      nodes: cloneGraph(project.nodes),
+      edges: cloneGraph(project.edges),
+      projectName: project.name,
+    };
+    stashGraphInMap(targetId, entry);
+    if (targetId === taskId) {
+      setProjectName(entry.projectName);
+      setNodes(cloneGraph(entry.nodes));
+      setEdges(cloneGraph(entry.edges));
+      resetTransientGraphState();
+      scheduleFitView();
+    } else {
+      setTask(nextTask);
+    }
+    setStatus(`Loaded project ${project.name} into ${targetId}`);
+  };
+
+  const stashGraphInMap = (id, entry) => {
+    const merged = { ...graphsByTaskRef.current, [id]: entry };
+    graphsByTaskRef.current = merged;
+    setGraphsByTask(merged);
+    return merged;
   };
 
   const applyGraphFromBest = async (id) => {
     try {
       const { data } = await axios.get(`/api/best-graph/${id}`);
-      setProjectName(data.projectName || `best-${id}-onnx`);
-      setNodes(cloneGraph(data.nodes || []));
-      setEdges(cloneGraph(data.edges || []));
-      resetTransientGraphState();
+      const entry = {
+        nodes: cloneGraph(data.nodes || []),
+        edges: cloneGraph(data.edges || []),
+        projectName: data.projectName || `best-${id}-onnx`,
+      };
+      stashGraphInMap(id, entry);
+      if (id === taskId) {
+        setProjectName(entry.projectName);
+        setNodes(cloneGraph(entry.nodes));
+        setEdges(cloneGraph(entry.edges));
+        resetTransientGraphState();
+        scheduleFitView();
+      }
       setStatus(`Loaded ONNX graph for ${id}: ${data.meta?.nodeCount || 0} raw nodes`);
-      scheduleFitView();
       return true;
     } catch (error) {
       const response = error.response?.data;
@@ -607,12 +704,38 @@ function App() {
       if (rejected.length) parts.push(`${rejected.length} rejected`);
       setStatus(`Import: ${parts.join(", ")}`);
       if (saved.length > 0) {
+        const fetched = await Promise.all(saved.map(async (id) => {
+          try {
+            const { data } = await axios.get(`/api/best-graph/${id}`);
+            return [id, {
+              nodes: cloneGraph(data.nodes || []),
+              edges: cloneGraph(data.edges || []),
+              projectName: data.projectName || `best-${id}-onnx`,
+            }];
+          } catch {
+            return null;
+          }
+        }));
+        const newMap = { ...graphsByTaskRef.current };
+        for (const entry of fetched) {
+          if (entry) newMap[entry[0]] = entry[1];
+        }
+        graphsByTaskRef.current = newMap;
+        setGraphsByTask(newMap);
         const target = saved.includes(taskId) ? taskId : saved[0];
         const targetNumber = Number(target.replace("task", ""));
         if (Number.isFinite(targetNumber) && target !== taskId) {
           setTask(clampTask(targetNumber));
+        } else {
+          const fresh = newMap[target];
+          if (fresh) {
+            setNodes(cloneGraph(fresh.nodes));
+            setEdges(cloneGraph(fresh.edges));
+            setProjectName(fresh.projectName);
+            resetTransientGraphState();
+            scheduleFitView();
+          }
         }
-        await applyGraphFromBest(target);
       }
     } catch (error) {
       const reason = error.response?.data?.reason || error.message;
