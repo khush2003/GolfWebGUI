@@ -834,6 +834,13 @@ def _onnx_attrs_for_gui(node: onnx.NodeProto) -> dict[str, Any]:
     return {attr.name: _json_ready(helper.get_attribute_value(attr)) for attr in node.attribute}
 
 
+def _safe_source_label(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _best_onnx_path(task_id: str) -> Path:
     task_id = task_id.strip().lower()
     if not TASK_ID_RE.match(task_id):
@@ -986,7 +993,7 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
         "nodes": nodes,
         "edges": edges,
         "meta": {
-            "source": str(path.relative_to(ROOT)),
+            "source": _safe_source_label(path),
             "rawOnnx": True,
             "nodeCount": len(model.graph.node),
             "initializerCount": len(model.graph.initializer),
