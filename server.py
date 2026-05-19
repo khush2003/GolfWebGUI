@@ -79,6 +79,7 @@ SUPPORTED_OPS = {
     "Tile",
     "Resize",
     "Conv",
+    "Gather",
     "RowIndex",
     "ColIndex",
 }
@@ -124,6 +125,7 @@ INPUT_SLOT_ORDER = {
     "ReduceMin": ["input"],
     "Where": ["condition", "true", "false"],
     "Concat": ["a", "b"],
+    "Gather": ["data", "indices"],
 }
 
 app = FastAPI(title="NeuroGolf Lab")
@@ -232,6 +234,8 @@ def _shape(data: dict[str, Any] | None, default: list[int] | None = None) -> lis
     data = data or {}
     raw = data.get("shape") if data.get("shape") not in ("", None) else (default or CANVAS_SHAPE)
     raw = _parse_literal(raw)
+    if isinstance(raw, int):
+        raw = [raw]
     if isinstance(raw, str):
         raw = [int(part.strip()) for part in raw.replace("x", ",").split(",") if part.strip()]
     if not isinstance(raw, list) or not raw or not all(isinstance(item, int) and item > 0 for item in raw):
@@ -275,6 +279,8 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
         return result
     if op == "Mod":
         return {"fmod": int(attrs.get("fmod", 0))}
+    if op == "Gather":
+        return {"axis": int(attrs.get("axis", 0))}
     return {}
 
 
@@ -406,6 +412,10 @@ def _tensor_type_for_cast(attrs: dict[str, Any]) -> int:
     return int(attrs.get("to", TensorProto.FLOAT))
 
 
+def _np_dtype_for_tensor_proto(dtype: int) -> np.dtype:
+    return np.dtype(helper.tensor_dtype_to_np_dtype(dtype))
+
+
 def _validate_graph(payload: ExportPayload) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     if not payload.nodes:
         raise ValueError("Graph must contain at least one node")
@@ -504,10 +514,7 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "ReduceMax": 1,
         "ReduceMin": 1,
         "ArgMax": 1,
-        "Slice": 1,
-        "Pad": 1,
         "Transpose": 1,
-        "Tile": 1,
         "Resize": 1,
         "Conv": 1,
         "Equal": 2,
@@ -532,10 +539,20 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Clip": 1,
         "Sign": 1,
         "Sqrt": 1,
+        "Gather": 2,
+    }
+    flexible = {
+        "Tile": (1, 2),
+        "Slice": (1, 5),
+        "Pad": (1, 3),
     }
     expected = required.get(op)
     if expected is not None and len(ids) != expected:
         raise ValueError(f"{op} node {node_id!r} requires {expected} input edge(s), got {len(ids)}")
+    if op in flexible:
+        low, high = flexible[op]
+        if not (low <= len(ids) <= high):
+            raise ValueError(f"{op} node {node_id!r} requires {low}–{high} input edge(s), got {len(ids)}")
     if op == "Concat" and len(ids) < 2:
         raise ValueError(f"Concat node {node_id!r} requires at least 2 input edge(s), got {len(ids)}")
     if op in {"Min", "Max", "Sum"} and len(ids) < 2:
@@ -543,14 +560,16 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
 
 
 def _constant_array(data: dict[str, Any], shape: list[int]) -> np.ndarray:
+    dtype_int = int(data.get("dataType", TensorProto.FLOAT))
+    np_dtype = _np_dtype_for_tensor_proto(dtype_int)
     values = data.get("values", data.get("value"))
     if values is None:
-        return np.zeros(shape, dtype=np.float32)
-    array = np.asarray(_parse_literal(values), dtype=np.float32)
+        return np.zeros(shape, dtype=np_dtype)
+    array = np.asarray(_parse_literal(values))
     if array.size == 1 and int(np.prod(shape)) != 1:
-        return np.full(shape, float(array.reshape(-1)[0]), dtype=np.float32)
+        return np.full(shape, array.reshape(-1)[0], dtype=np_dtype)
     try:
-        return array.reshape(shape).astype(np.float32)
+        return array.reshape(shape).astype(np_dtype)
     except ValueError as exc:
         raise ValueError(f"Constant values cannot be reshaped to {shape}") from exc
 
@@ -576,6 +595,7 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
     tensor_name: dict[str, str] = {}
     tensor_shape: dict[str, list[int]] = {}
     tensor_type: dict[str, int] = {}
+    constant_values: dict[str, np.ndarray] = {}
 
     for node in sorted_nodes:
         node_id = _node_id(node)
@@ -586,8 +606,6 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
 
         if op == "Input":
             shape = _shape(data, CANVAS_SHAPE)
-            if shape != CANVAS_SHAPE:
-                raise ValueError(f"Input node {node_id!r} must use static shape {CANVAS_SHAPE}")
             tensor_name[node_id] = output_name
             tensor_shape[node_id] = shape
             tensor_type[node_id] = TensorProto.FLOAT
@@ -607,11 +625,13 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             shape = _shape(data, CANVAS_SHAPE)
             array = _constant_array(data, shape)
             tensor = numpy_helper.from_array(array, name=f"{node_id}_value")
+            dtype_int = int(tensor.data_type)
             tensor_name[node_id] = output_name
             tensor_shape[node_id] = shape
-            tensor_type[node_id] = TensorProto.FLOAT
+            tensor_type[node_id] = dtype_int
+            constant_values[node_id] = array
             onnx_nodes.append(helper.make_node("Constant", inputs=[], outputs=[output_name], name=node_id, value=tensor))
-            value_infos.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT, shape))
+            value_infos.append(helper.make_tensor_value_info(output_name, dtype_int, shape))
             continue
 
         if op in {"RowIndex", "ColIndex"}:
@@ -693,33 +713,67 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             shape = _output_shape_for_argmax(input_shapes[0], attrs)
             out_type = TensorProto.INT64
         elif op == "Slice":
-            starts = _int_list(attrs.get("starts"), [0, 0, 0, 0])
-            ends = _int_list(attrs.get("ends"), input_shapes[0])
-            axes = _int_list(attrs.get("axes"), list(range(len(starts))))
-            steps = _int_list(attrs.get("steps"), [1 for _ in starts])
-            shape = _output_shape_for_slice(input_shapes[0], {"starts": starts, "ends": ends, "axes": axes, "steps": steps})
-            for suffix, values in {"starts": starts, "ends": ends, "axes": axes, "steps": steps}.items():
-                initializer_name = f"{node_id}_{suffix}"
-                initializers.append(helper.make_tensor(initializer_name, TensorProto.INT64, [len(values)], [int(item) for item in values]))
-                node_inputs.append(initializer_name)
+            if len(input_ids) == 1:
+                starts = _int_list(attrs.get("starts"), [0, 0, 0, 0])
+                ends = _int_list(attrs.get("ends"), input_shapes[0])
+                axes = _int_list(attrs.get("axes"), list(range(len(starts))))
+                steps = _int_list(attrs.get("steps"), [1 for _ in starts])
+                shape = _output_shape_for_slice(input_shapes[0], {"starts": starts, "ends": ends, "axes": axes, "steps": steps})
+                node_inputs = [inputs[0]]
+                for suffix, values in {"starts": starts, "ends": ends, "axes": axes, "steps": steps}.items():
+                    initializer_name = f"{node_id}_{suffix}"
+                    initializers.append(helper.make_tensor(initializer_name, TensorProto.INT64, [len(values)], [int(item) for item in values]))
+                    node_inputs.append(initializer_name)
+            else:
+                for idx, role in enumerate(("starts", "ends", "axes", "steps"), start=1):
+                    if idx < len(input_ids) and input_ids[idx] not in constant_values:
+                        raise ValueError(f"Slice node {node_id!r} expects its {role} input to be a Constant")
+                starts = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                ends = [int(item) for item in constant_values[input_ids[2]].reshape(-1).tolist()]
+                axes = (
+                    [int(item) for item in constant_values[input_ids[3]].reshape(-1).tolist()]
+                    if len(input_ids) >= 4
+                    else list(range(len(starts)))
+                )
+                steps = (
+                    [int(item) for item in constant_values[input_ids[4]].reshape(-1).tolist()]
+                    if len(input_ids) >= 5
+                    else [1 for _ in starts]
+                )
+                shape = _output_shape_for_slice(input_shapes[0], {"starts": starts, "ends": ends, "axes": axes, "steps": steps})
+                node_inputs = list(inputs)
         elif op == "Pad":
-            pads = _int_list(attrs.get("pads"), [0 for _ in range(2 * len(input_shapes[0]))])
-            shape = _output_shape_for_pad(input_shapes[0], {"pads": pads})
-            pads_name = f"{node_id}_pads"
-            value_name = f"{node_id}_constant_value"
-            initializers.append(helper.make_tensor(pads_name, TensorProto.INT64, [len(pads)], [int(item) for item in pads]))
-            initializers.append(helper.make_tensor(value_name, TensorProto.FLOAT, [], [float(attrs.get("value", 0))]))
-            node_inputs = [inputs[0], pads_name, value_name]
+            if len(input_ids) == 1:
+                pads = _int_list(attrs.get("pads"), [0 for _ in range(2 * len(input_shapes[0]))])
+                shape = _output_shape_for_pad(input_shapes[0], {"pads": pads})
+                pads_name = f"{node_id}_pads"
+                value_name = f"{node_id}_constant_value"
+                initializers.append(helper.make_tensor(pads_name, TensorProto.INT64, [len(pads)], [int(item) for item in pads]))
+                initializers.append(helper.make_tensor(value_name, TensorProto.FLOAT, [], [float(attrs.get("value", 0))]))
+                node_inputs = [inputs[0], pads_name, value_name]
+            else:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"Pad node {node_id!r} expects its pads input to be a Constant")
+                pads = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                shape = _output_shape_for_pad(input_shapes[0], {"pads": pads})
+                node_inputs = list(inputs)
         elif op == "Concat":
             shape = _output_shape_for_concat(input_shapes, attrs)
         elif op == "Transpose":
             shape = _output_shape_for_transpose(input_shapes[0], attrs)
         elif op == "Tile":
-            repeats = _int_list(attrs.get("repeats"), [1 for _ in input_shapes[0]])
-            shape = _output_shape_for_tile(input_shapes[0], {"repeats": repeats})
-            repeats_name = f"{node_id}_repeats"
-            initializers.append(helper.make_tensor(repeats_name, TensorProto.INT64, [len(repeats)], [int(item) for item in repeats]))
-            node_inputs = [inputs[0], repeats_name]
+            if len(input_ids) == 1:
+                repeats = _int_list(attrs.get("repeats"), [1 for _ in input_shapes[0]])
+                shape = _output_shape_for_tile(input_shapes[0], {"repeats": repeats})
+                repeats_name = f"{node_id}_repeats"
+                initializers.append(helper.make_tensor(repeats_name, TensorProto.INT64, [len(repeats)], [int(item) for item in repeats]))
+                node_inputs = [inputs[0], repeats_name]
+            else:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"Tile node {node_id!r} expects its repeats input to be a Constant")
+                repeats = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                shape = _output_shape_for_tile(input_shapes[0], {"repeats": repeats})
+                node_inputs = list(inputs)
         elif op == "Resize":
             shape = _output_shape_for_resize(input_shapes[0], attrs)
             roi_name = f"{node_id}_roi"
@@ -746,6 +800,13 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                 initializers.append(numpy_helper.from_array(bias, name=bias_name))
                 node_inputs.append(bias_name)
             shape = _output_shape_for_conv(input_shapes[0], attrs, weight_shape)
+        elif op == "Gather":
+            axis = int(attrs.get("axis", 0))
+            data_shape = list(input_shapes[0])
+            indices_shape = list(input_shapes[1])
+            actual_axis = (axis + len(data_shape)) % len(data_shape)
+            shape = data_shape[:actual_axis] + indices_shape + data_shape[actual_axis + 1:]
+            out_type = input_types[0]
 
         tensor_name[node_id] = output_name
         tensor_shape[node_id] = shape
@@ -841,6 +902,86 @@ def _safe_source_label(path: Path) -> str:
         return str(path)
 
 
+def _layout_positions(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    if not nodes:
+        return {}
+
+    node_ids = [n["id"] for n in nodes]
+    id_set = set(node_ids)
+    original_index = {nid: i for i, nid in enumerate(node_ids)}
+    op_of = {n["id"]: (n.get("data") or {}).get("opType", "") for n in nodes}
+
+    producers: dict[str, list[str]] = {nid: [] for nid in node_ids}
+    consumers: dict[str, list[str]] = {nid: [] for nid in node_ids}
+    for edge in edges:
+        src = edge.get("source")
+        tgt = edge.get("target")
+        if src in id_set and tgt in id_set and src != tgt:
+            producers[tgt].append(src)
+            consumers[src].append(tgt)
+
+    layer: dict[str, int] = {}
+
+    def assign(nid: str, stack: set[str]) -> int:
+        if nid in layer:
+            return layer[nid]
+        if nid in stack:
+            return 0
+        stack.add(nid)
+        if not producers[nid]:
+            layer[nid] = 0
+        else:
+            layer[nid] = max(assign(p, stack) for p in producers[nid]) + 1
+        stack.discard(nid)
+        return layer[nid]
+
+    for nid in node_ids:
+        assign(nid, set())
+
+    for nid in node_ids:
+        if op_of[nid] == "Constant" and not producers[nid] and consumers[nid]:
+            layer[nid] = max(0, min(layer[c] for c in consumers[nid]) - 1)
+
+    if layer:
+        non_output_max = max(
+            (layer[nid] for nid in node_ids if op_of[nid] != "Output"),
+            default=0,
+        )
+        for nid in node_ids:
+            if op_of[nid] == "Output":
+                layer[nid] = max(layer[nid], non_output_max + 1)
+
+    layered: dict[int, list[str]] = {}
+    for nid in node_ids:
+        layered.setdefault(layer[nid], []).append(nid)
+
+    row: dict[str, int] = {}
+    for lay in sorted(layered.keys()):
+        ids = layered[lay]
+        if lay > 0:
+            def key(nid: str) -> tuple[float, int]:
+                prods = [p for p in producers[nid] if p in row]
+                if prods:
+                    mean = sum(row[p] for p in prods) / len(prods)
+                else:
+                    mean = float(original_index[nid])
+                return (mean, original_index[nid])
+            ids = sorted(ids, key=key)
+            layered[lay] = ids
+        for r, nid in enumerate(ids):
+            row[nid] = r
+
+    X_SPACING = 220
+    Y_SPACING = 130
+    X_OFFSET = 70
+    Y_OFFSET = 60
+    positions: dict[str, dict[str, int]] = {}
+    for lay, ids in layered.items():
+        for r, nid in enumerate(ids):
+            positions[nid] = {"x": X_OFFSET + lay * X_SPACING, "y": Y_OFFSET + r * Y_SPACING}
+    return positions
+
+
 def _best_onnx_path(task_id: str) -> Path:
     task_id = task_id.strip().lower()
     if not TASK_ID_RE.match(task_id):
@@ -907,20 +1048,24 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
 
     for initializer in model.graph.initializer:
         array = numpy_helper.to_array(initializer)
+        flat = array.reshape(-1).tolist()
+        shape_str = ",".join(str(item) for item in array.shape) or "1"
         node_id = add_node(
             initializer.name,
             f"init_{index}",
             "Constant",
             index,
             {
-                "shape": ",".join(str(item) for item in array.shape),
+                "shape": shape_str,
                 "sourceName": initializer.name,
                 "inputSlots": [],
+                "dataType": int(initializer.data_type),
+                "values": flat,
                 "attrs": {
                     "source": "onnx-initializer",
                     "dataType": int(initializer.data_type),
                     "size": int(array.size),
-                    "valuesPreview": array.reshape(-1)[:12].tolist(),
+                    "valuesPreview": flat[:12],
                 },
             },
         )
@@ -929,16 +1074,26 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
 
     for node_index, onnx_node in enumerate(model.graph.node, start=1):
         slots = [f"in{slot_index}" for slot_index, name in enumerate(onnx_node.input) if name]
+        node_data: dict[str, Any] = {
+            "sourceName": onnx_node.name,
+            "inputSlots": slots,
+            "attrs": _onnx_attrs_for_gui(onnx_node),
+        }
+        if onnx_node.op_type == "Constant":
+            for attr in onnx_node.attribute:
+                if attr.name == "value":
+                    tensor_proto = helper.get_attribute_value(attr)
+                    arr = numpy_helper.to_array(tensor_proto)
+                    node_data["shape"] = ",".join(str(item) for item in arr.shape) or "1"
+                    node_data["dataType"] = int(tensor_proto.data_type)
+                    node_data["values"] = arr.reshape(-1).tolist()
+                    break
         node_id = add_node(
             onnx_node.name or f"{onnx_node.op_type}_{node_index}",
             f"onnx_{node_index}",
             onnx_node.op_type,
             index,
-            {
-                "sourceName": onnx_node.name,
-                "inputSlots": slots,
-                "attrs": _onnx_attrs_for_gui(onnx_node),
-            },
+            node_data,
         )
         index += 1
         visible_slot = 0
@@ -986,6 +1141,11 @@ def onnx_to_gui_graph(task_id: str) -> dict[str, Any]:
                     "data": {"tensor": output.name},
                 }
             )
+
+    positions = _layout_positions(nodes, edges)
+    for node in nodes:
+        if node["id"] in positions:
+            node["position"] = positions[node["id"]]
 
     return {
         "projectName": f"best-{task_id}-onnx",
