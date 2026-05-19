@@ -416,6 +416,22 @@ def _np_dtype_for_tensor_proto(dtype: int) -> np.dtype:
     return np.dtype(helper.tensor_dtype_to_np_dtype(dtype))
 
 
+def _broadcast_shapes(shapes: list[list[int]]) -> list[int]:
+    if not shapes:
+        return []
+    max_rank = max(len(shape) for shape in shapes)
+    padded = [[1] * (max_rank - len(shape)) + list(shape) for shape in shapes]
+    result = []
+    for axis_index, dims in enumerate(zip(*padded)):
+        non_one = {dim for dim in dims if dim != 1}
+        if len(non_one) > 1:
+            raise ValueError(
+                f"shapes {shapes} cannot be broadcast on axis {axis_index} (sizes {sorted(non_one)})"
+            )
+        result.append(max(dims))
+    return result
+
+
 def _validate_graph(payload: ExportPayload) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     if not payload.nodes:
         raise ValueError("Graph must contain at least one node")
@@ -673,10 +689,10 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             "Where",
         }
         if op in same_shape_ops:
-            for idx, input_shape in enumerate(input_shapes, start=1):
-                if input_shape != input_shapes[0]:
-                    raise ValueError(f"{op} node {node_id!r} input {idx} shape {input_shape} does not match {input_shapes[0]}")
-            shape = input_shapes[0]
+            try:
+                shape = _broadcast_shapes(input_shapes)
+            except ValueError as exc:
+                raise ValueError(f"{op} node {node_id!r}: {exc}") from exc
         if op in {"Equal", "Greater", "Less", "GreaterOrEqual", "LessOrEqual"}:
             out_type = TensorProto.BOOL
         elif op in {"Not", "And", "Or", "Xor"}:
