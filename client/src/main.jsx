@@ -896,7 +896,7 @@ function App() {
     setStatus("Running graph");
     setLastRun({ state: "loading", taskId, example: `${exampleMode} ${exampleIndex + 1}`, at: nowLabel() });
     try {
-      const payload = { ...exportPayload, inputGrid: example.input };
+      const payload = { ...exportPayload, inputGrid: example.input, expectedOutput: example.output || example.target || null };
       const { data } = await axios.post("/api/run", payload);
       setRunOutput(data.grid);
       setLastRun({ state: "passed", taskId, shape: gridShape(data.grid), example: `${exampleMode} ${exampleIndex + 1}`, at: nowLabel() });

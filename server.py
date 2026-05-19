@@ -31,6 +31,16 @@ def _ort_providers() -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def _ort_session_options() -> ort.SessionOptions:
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return opts
+
+
+def _make_inference_session(model_bytes: bytes) -> ort.InferenceSession:
+    return ort.InferenceSession(model_bytes, sess_options=_ort_session_options(), providers=_ort_providers())
+
+
 ROOT = Path(__file__).resolve().parent
 CLIENT_DIST = ROOT / "client" / "dist"
 CLIENT_PUBLIC = ROOT / "client" / "public"
@@ -158,6 +168,7 @@ class ExportPayload(BaseModel):
 
 class RunPayload(ExportPayload):
     inputGrid: Any | None = None
+    expectedOutput: Any | None = None
 
 
 class ValidationError(Exception):
@@ -1449,7 +1460,7 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
         raise ValidationError("Phase 1 Strict Equivalence failed: no ARC training pairs were supplied")
 
     try:
-        session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
+        session = _make_inference_session(model.SerializeToString())
     except Exception as exc:
         raise ValidationError(f"Phase 1 Strict Equivalence failed: ONNX Runtime could not load model: {exc}") from exc
 
@@ -1524,11 +1535,18 @@ def run_onnx(payload: RunPayload):
             source_grid = payload.trainingPairs[0].get("input")
         if source_grid is None:
             raise ValueError("Run input grid is missing")
-        session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
+        session = _make_inference_session(model.SerializeToString())
         raw_actual, input_region = _run_session(session, source_grid)
         actual = _decode_model_output(raw_actual)
         _assert_color_bounds("Run", actual)
-        out_region = _detect_output_region(actual, input_region)
+        if payload.expectedOutput is not None:
+            exp_arr = np.asarray(payload.expectedOutput)
+            if exp_arr.ndim == 2:
+                out_region = (int(exp_arr.shape[0]), int(exp_arr.shape[1]))
+            else:
+                out_region = _detect_output_region(actual, input_region)
+        else:
+            out_region = _detect_output_region(actual, input_region)
         return {
             "status": "ran",
             "source": source,
