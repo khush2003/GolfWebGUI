@@ -80,6 +80,11 @@ SUPPORTED_OPS = {
     "Resize",
     "Conv",
     "Gather",
+    "GatherND",
+    "Squeeze",
+    "Unsqueeze",
+    "Reshape",
+    "Expand",
     "RowIndex",
     "ColIndex",
 }
@@ -126,6 +131,11 @@ INPUT_SLOT_ORDER = {
     "Where": ["condition", "true", "false"],
     "Concat": ["a", "b"],
     "Gather": ["data", "indices"],
+    "GatherND": ["data", "indices"],
+    "Squeeze": ["input"],
+    "Unsqueeze": ["input"],
+    "Reshape": ["data", "shape"],
+    "Expand": ["input", "shape"],
 }
 
 app = FastAPI(title="NeuroGolf Lab")
@@ -281,6 +291,10 @@ def _onnx_attrs(op: str, attrs: dict[str, Any]) -> dict[str, Any]:
         return {"fmod": int(attrs.get("fmod", 0))}
     if op == "Gather":
         return {"axis": int(attrs.get("axis", 0))}
+    if op in {"Squeeze", "Unsqueeze", "Reshape", "Expand"}:
+        return {}
+    if op == "GatherND":
+        return {"batch_dims": int(attrs.get("batch_dims", 0))}
     return {}
 
 
@@ -526,13 +540,9 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Cast": 1,
         "Identity": 1,
         "Not": 1,
-        "ReduceSum": 1,
-        "ReduceMax": 1,
-        "ReduceMin": 1,
         "ArgMax": 1,
         "Transpose": 1,
         "Resize": 1,
-        "Conv": 1,
         "Equal": 2,
         "Greater": 2,
         "Less": 2,
@@ -561,6 +571,15 @@ def _expect_inputs(op: str, node_id: str, ids: list[str]) -> None:
         "Tile": (1, 2),
         "Slice": (1, 5),
         "Pad": (1, 3),
+        "ReduceSum": (1, 2),
+        "ReduceMax": (1, 2),
+        "ReduceMin": (1, 2),
+        "Squeeze": (1, 2),
+        "Unsqueeze": (1, 2),
+        "Reshape": (2, 2),
+        "Expand": (2, 2),
+        "Conv": (1, 3),
+        "GatherND": (2, 2),
     }
     expected = required.get(op)
     if expected is not None and len(ids) != expected:
@@ -668,6 +687,7 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
         shape = _shape(data, input_shapes[0])
         out_type = input_types[0]
         node_inputs = inputs
+        node_attrs_override: dict[str, Any] | None = None
 
         same_shape_ops = {
             "Equal",
@@ -704,14 +724,22 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
                 raise ValueError(f"Where node {node_id!r} true/false inputs must have matching tensor types")
             out_type = input_types[1]
         elif op in {"ReduceSum", "ReduceMax", "ReduceMin"}:
-            axes = attrs.get("axes")
-            shape = _output_shape_for_reduction(input_shapes[0], attrs)
-            if op == "ReduceSum" and axes is not None:
-                if isinstance(axes, int):
-                    axes = [axes]
-                axes_name = f"{node_id}_axes"
-                initializers.append(helper.make_tensor(axes_name, TensorProto.INT64, [len(axes)], [int(axis) for axis in axes]))
-                node_inputs = [inputs[0], axes_name]
+            if len(input_ids) >= 2:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"{op} node {node_id!r} expects its axes input to be a Constant")
+                axes_values = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                shape = _output_shape_for_reduction(input_shapes[0], {**attrs, "axes": axes_values})
+                node_inputs = [inputs[0], inputs[1]]
+                node_attrs_override = {"keepdims": int(attrs.get("keepdims", 1))}
+            else:
+                axes = attrs.get("axes")
+                if op == "ReduceSum" and axes is not None:
+                    if isinstance(axes, int):
+                        axes = [axes]
+                    axes_name = f"{node_id}_axes"
+                    initializers.append(helper.make_tensor(axes_name, TensorProto.INT64, [len(axes)], [int(axis) for axis in axes]))
+                    node_inputs = [inputs[0], axes_name]
+                shape = _output_shape_for_reduction(input_shapes[0], attrs)
         elif op == "Clip":
             if "min" in attrs or "max" in attrs:
                 node_inputs = [inputs[0]]
@@ -800,22 +828,123 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
             initializers.append(helper.make_tensor(sizes_name, TensorProto.INT64, [len(shape)], [int(item) for item in shape]))
             node_inputs = [inputs[0], roi_name, scales_name, sizes_name]
         elif op == "Conv":
-            weights = attrs.get("weights", attrs.get("kernel", [1]))
-            weight_shape = _shape({"shape": attrs.get("weight_shape", attrs.get("kernel_shape", [1, input_shapes[0][1], 1, 1]))})
-            weight_array = np.asarray(_parse_literal(weights), dtype=np.float32)
-            if weight_array.size == 1 and int(np.prod(weight_shape)) != 1:
-                weight_array = np.full(weight_shape, float(weight_array.reshape(-1)[0]), dtype=np.float32)
+            if len(input_ids) >= 2:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"Conv node {node_id!r} expects weights input to be a Constant")
+                weight_array = constant_values[input_ids[1]]
+                weight_shape = list(weight_array.shape)
+                node_inputs = [inputs[0], inputs[1]]
+                if len(input_ids) >= 3:
+                    if input_ids[2] not in constant_values:
+                        raise ValueError(f"Conv node {node_id!r} expects bias input to be a Constant")
+                    node_inputs.append(inputs[2])
             else:
-                weight_array = weight_array.reshape(weight_shape).astype(np.float32)
-            weight_name = f"{node_id}_weights"
-            initializers.append(numpy_helper.from_array(weight_array, name=weight_name))
-            node_inputs = [inputs[0], weight_name]
-            if "bias" in attrs:
-                bias = np.asarray(_parse_literal(attrs["bias"]), dtype=np.float32).reshape([weight_shape[0]])
-                bias_name = f"{node_id}_bias"
-                initializers.append(numpy_helper.from_array(bias, name=bias_name))
-                node_inputs.append(bias_name)
+                weights = attrs.get("weights", attrs.get("kernel", [1]))
+                weight_shape = _shape({"shape": attrs.get("weight_shape", attrs.get("kernel_shape", [1, input_shapes[0][1], 1, 1]))})
+                weight_array = np.asarray(_parse_literal(weights), dtype=np.float32)
+                if weight_array.size == 1 and int(np.prod(weight_shape)) != 1:
+                    weight_array = np.full(weight_shape, float(weight_array.reshape(-1)[0]), dtype=np.float32)
+                else:
+                    weight_array = weight_array.reshape(weight_shape).astype(np.float32)
+                weight_name = f"{node_id}_weights"
+                initializers.append(numpy_helper.from_array(weight_array, name=weight_name))
+                node_inputs = [inputs[0], weight_name]
+                if "bias" in attrs:
+                    bias = np.asarray(_parse_literal(attrs["bias"]), dtype=np.float32).reshape([weight_shape[0]])
+                    bias_name = f"{node_id}_bias"
+                    initializers.append(numpy_helper.from_array(bias, name=bias_name))
+                    node_inputs.append(bias_name)
             shape = _output_shape_for_conv(input_shapes[0], attrs, weight_shape)
+        elif op == "Squeeze":
+            in_shape = list(input_shapes[0])
+            if len(input_ids) >= 2:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"Squeeze node {node_id!r} expects axes input to be a Constant")
+                axes_list = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                node_inputs = [inputs[0], inputs[1]]
+            else:
+                raw_axes = attrs.get("axes")
+                if isinstance(raw_axes, int):
+                    axes_list = [raw_axes]
+                elif isinstance(raw_axes, list):
+                    axes_list = [int(item) for item in raw_axes]
+                else:
+                    axes_list = []
+            if axes_list:
+                normalized = sorted({(a + len(in_shape)) % len(in_shape) for a in axes_list})
+                shape = [d for i, d in enumerate(in_shape) if i not in normalized]
+            else:
+                shape = [d for d in in_shape if d != 1]
+            if not shape:
+                shape = [1]
+        elif op == "Unsqueeze":
+            in_shape = list(input_shapes[0])
+            if len(input_ids) >= 2:
+                if input_ids[1] not in constant_values:
+                    raise ValueError(f"Unsqueeze node {node_id!r} expects axes input to be a Constant")
+                axes_list = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+                node_inputs = [inputs[0], inputs[1]]
+            else:
+                raw_axes = attrs.get("axes")
+                if isinstance(raw_axes, int):
+                    axes_list = [raw_axes]
+                elif isinstance(raw_axes, list):
+                    axes_list = [int(item) for item in raw_axes]
+                else:
+                    axes_list = []
+            if not axes_list:
+                raise ValueError(f"Unsqueeze node {node_id!r} requires axes")
+            out_rank = len(in_shape) + len(axes_list)
+            normalized = sorted({(a + out_rank) % out_rank for a in axes_list})
+            shape = list(in_shape)
+            for ax in normalized:
+                shape.insert(ax, 1)
+        elif op == "Reshape":
+            if input_ids[1] not in constant_values:
+                raise ValueError(f"Reshape node {node_id!r} expects shape input to be a Constant")
+            target = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+            in_shape = list(input_shapes[0])
+            in_size = 1
+            for d in in_shape:
+                in_size *= d
+            resolved = []
+            minus_one_index = -1
+            for i, dim in enumerate(target):
+                if dim == 0:
+                    resolved.append(in_shape[i] if i < len(in_shape) else 1)
+                elif dim == -1:
+                    if minus_one_index >= 0:
+                        raise ValueError(f"Reshape node {node_id!r} has more than one -1 dim")
+                    resolved.append(-1)
+                    minus_one_index = i
+                else:
+                    resolved.append(int(dim))
+            if minus_one_index >= 0:
+                known = 1
+                for dim in resolved:
+                    if dim != -1:
+                        known *= dim
+                if known == 0:
+                    raise ValueError(f"Reshape node {node_id!r} cannot infer -1 (other dims are 0)")
+                resolved[minus_one_index] = in_size // known
+            shape = resolved
+            node_inputs = [inputs[0], inputs[1]]
+        elif op == "Expand":
+            if input_ids[1] not in constant_values:
+                raise ValueError(f"Expand node {node_id!r} expects shape input to be a Constant")
+            target = [int(item) for item in constant_values[input_ids[1]].reshape(-1).tolist()]
+            try:
+                shape = _broadcast_shapes([list(input_shapes[0]), target])
+            except ValueError as exc:
+                raise ValueError(f"Expand node {node_id!r}: {exc}") from exc
+            node_inputs = [inputs[0], inputs[1]]
+        elif op == "GatherND":
+            batch_dims = int(attrs.get("batch_dims", 0))
+            data_shape = list(input_shapes[0])
+            indices_shape = list(input_shapes[1])
+            last = indices_shape[-1] if indices_shape else 0
+            shape = indices_shape[:-1] + data_shape[batch_dims + last:]
+            out_type = input_types[0]
         elif op == "Gather":
             axis = int(attrs.get("axis", 0))
             data_shape = list(input_shapes[0])
@@ -827,7 +956,8 @@ def compile_graph(payload: ExportPayload) -> onnx.ModelProto:
         tensor_name[node_id] = output_name
         tensor_shape[node_id] = shape
         tensor_type[node_id] = out_type
-        onnx_nodes.append(helper.make_node(op, inputs=node_inputs, outputs=[output_name], name=node_id, **_onnx_attrs(op, attrs)))
+        final_attrs = node_attrs_override if node_attrs_override is not None else _onnx_attrs(op, attrs)
+        onnx_nodes.append(helper.make_node(op, inputs=node_inputs, outputs=[output_name], name=node_id, **final_attrs))
         value_infos.append(helper.make_tensor_value_info(output_name, out_type, shape))
 
     if not graph_outputs:
@@ -852,6 +982,27 @@ def save_model(model: onnx.ModelProto, payload: ExportPayload) -> Path:
     out_path = out_dir / f"{task_id}.onnx"
     onnx.save(model, out_path)
     return out_path
+
+
+def _try_load_imported_model(payload: ExportPayload) -> onnx.ModelProto | None:
+    try:
+        task_id = _task_id(payload)
+    except Exception:
+        return None
+    path = IMPORT_DIR / f"{task_id}.onnx"
+    if not path.exists():
+        return None
+    try:
+        return onnx.load(path)
+    except Exception:
+        return None
+
+
+def _compile_or_fallback(payload: ExportPayload) -> tuple[onnx.ModelProto, str, str | None]:
+    imported = _try_load_imported_model(payload)
+    if imported is not None:
+        return imported, "imported", None
+    return compile_graph(payload), "compiled", None
 
 
 def _dim_value(dim: onnx.TensorShapeProto.Dimension) -> int | str | None:
@@ -1333,9 +1484,11 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
 @app.post("/api/compile")
 def compile_onnx(payload: ExportPayload):
     try:
-        model = compile_graph(payload)
+        model, source, fallback_reason = _compile_or_fallback(payload)
         return {
             "status": "compiled",
+            "source": source,
+            "fallbackReason": fallback_reason,
             "taskId": _task_id(payload),
             "modelBytes": len(model.SerializeToString()),
             "nodeCount": len(payload.nodes),
@@ -1349,7 +1502,7 @@ def compile_onnx(payload: ExportPayload):
 @app.post("/api/run")
 def run_onnx(payload: RunPayload):
     try:
-        model = compile_graph(payload)
+        model, source, _fallback_reason = _compile_or_fallback(payload)
         source_grid = payload.inputGrid
         if source_grid is None:
             if not payload.trainingPairs:
@@ -1358,10 +1511,12 @@ def run_onnx(payload: RunPayload):
         if source_grid is None:
             raise ValueError("Run input grid is missing")
         session = ort.InferenceSession(model.SerializeToString(), providers=_ort_providers())
-        actual, region = _run_session(session, source_grid)
+        raw_actual, region = _run_session(session, source_grid)
+        actual = _decode_model_output(raw_actual)
         _assert_color_bounds("Run", actual)
         return {
             "status": "ran",
+            "source": source,
             "taskId": _task_id(payload),
             "shape": list(actual.shape),
             "grid": _tensor_to_grid(actual, region),
@@ -1377,7 +1532,7 @@ def run_onnx(payload: RunPayload):
 def export_onnx(payload: ExportPayload):
     try:
         task_id = _task_id(payload)
-        model = compile_graph(payload)
+        model, _source, _fallback_reason = _compile_or_fallback(payload)
         validation = validate_model(model, payload)
         artifact = save_model(model, payload)
         token = os.getenv("HF_TOKEN")
