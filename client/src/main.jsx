@@ -194,6 +194,28 @@ function persistStoredGraphs(graphs) {
   window.localStorage.setItem(GRAPHS_STORAGE_KEY, JSON.stringify(graphs));
 }
 
+const SNAPSHOTS_STORAGE_KEY = "neurogolf-snapshots-v1";
+
+function loadSavedSnapshots() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SNAPSHOTS_STORAGE_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object") return {};
+    const cleaned = {};
+    for (const [name, entry] of Object.entries(parsed)) {
+      if (entry && entry.graphsByTask && typeof entry.graphsByTask === "object") {
+        cleaned[name] = { savedAt: entry.savedAt || null, graphsByTask: entry.graphsByTask };
+      }
+    }
+    return cleaned;
+  } catch {
+    return {};
+  }
+}
+
+function persistSavedSnapshots(snapshots) {
+  window.localStorage.setItem(SNAPSHOTS_STORAGE_KEY, JSON.stringify(snapshots));
+}
+
 function OpNode({ data, selected }) {
   const slots = data.inputSlots || inputSlots[data.opType] || [];
   return (
@@ -387,6 +409,10 @@ function App() {
   const [storedProjects, setStoredProjects] = useState(() => loadStoredProjects());
   const [graphsByTask, setGraphsByTask] = useState(() => loadStoredGraphs());
   const graphsByTaskRef = useRef({});
+  const [saveName, setSaveName] = useState("workspace-1");
+  const [savedSnapshots, setSavedSnapshots] = useState(() => loadSavedSnapshots());
+  const [selectedSaveName, setSelectedSaveName] = useState("");
+  const [selectedTemplateName, setSelectedTemplateName] = useState("");
   const [bestManifest, setBestManifest] = useState(null);
   const [bestLoadState, setBestLoadState] = useState("loading");
   const [selectedProjectName, setSelectedProjectName] = useState("baseline-cast-equal");
@@ -588,50 +614,49 @@ function App() {
     setLastExport({ state: "idle" });
   };
 
-  const newProject = () => {
-    const name = `neurogolf-${taskId}`;
-    setProjectName(name);
-    setNodes(cloneGraph(defaultNodes()));
-    setEdges(cloneGraph(defaultEdges()));
-    resetTransientGraphState();
-    setStatus(`New project ${name}`);
-    scheduleFitView();
-  };
-
-  const saveProject = () => {
-    const name = projectName.trim() || `neurogolf-${taskId}`;
-    const savedAt = new Date().toISOString();
-    const merged = {
+  const captureCurrentMap = () => {
+    const snapshot = {
       ...graphsByTaskRef.current,
       [taskId]: {
         nodes: cloneGraph(nodes),
         edges: cloneGraph(edges),
-        projectName: name,
-        savedAt,
+        projectName,
       },
     };
-    graphsByTaskRef.current = merged;
-    setGraphsByTask(merged);
-    persistStoredGraphs(merged);
-    setStoredProjects((current) => {
-      const named = { name, taskId, savedAt, nodes: cloneGraph(nodes), edges: cloneGraph(edges) };
-      const next = [named, ...current.filter((project) => project.name !== name)];
-      persistStoredProjects(next);
-      return next;
-    });
-    setSelectedProjectName(name);
-    setStatus(`Saved ${Object.keys(merged).length} task graph(s) (active: ${taskId})`);
+    graphsByTaskRef.current = snapshot;
+    return snapshot;
   };
 
-  const revertAllSaved = () => {
-    const fresh = loadStoredGraphs();
+  const saveAll = () => {
+    const name = saveName.trim() || "workspace";
+    const snapshot = captureCurrentMap();
+    setGraphsByTask(snapshot);
+    persistStoredGraphs(snapshot);
+    const savedAt = new Date().toISOString();
+    setSavedSnapshots((current) => {
+      const next = { ...current, [name]: { savedAt, graphsByTask: snapshot } };
+      persistSavedSnapshots(next);
+      return next;
+    });
+    setSelectedSaveName(name);
+    setStatus(`Saved "${name}" with ${Object.keys(snapshot).length} task graph(s)`);
+  };
+
+  const loadSelected = () => {
+    const entry = savedSnapshots[selectedSaveName];
+    if (!entry) {
+      setStatus("Select a save to load");
+      return;
+    }
+    const fresh = entry.graphsByTask || {};
     graphsByTaskRef.current = fresh;
     setGraphsByTask(fresh);
-    const entry = fresh[taskId];
-    if (entry) {
-      setProjectName(entry.projectName || `neurogolf-${taskId}`);
-      setNodes(cloneGraph(entry.nodes));
-      setEdges(cloneGraph(entry.edges));
+    persistStoredGraphs(fresh);
+    const current = fresh[taskId];
+    if (current) {
+      setProjectName(current.projectName || `neurogolf-${taskId}`);
+      setNodes(cloneGraph(current.nodes));
+      setEdges(cloneGraph(current.edges));
     } else {
       setProjectName(`neurogolf-${taskId}`);
       setNodes(cloneGraph(defaultNodes()));
@@ -639,33 +664,28 @@ function App() {
     }
     resetTransientGraphState();
     scheduleFitView();
-    setStatus(`Reverted ${Object.keys(fresh).length} task graph(s) to last save`);
+    setSaveName(selectedSaveName);
+    setStatus(`Loaded "${selectedSaveName}" with ${Object.keys(fresh).length} task graph(s)`);
   };
 
-  const loadProject = () => {
-    const project = availableProjects.find((item) => item.name === selectedProjectName);
-    if (!project) {
-      setStatus("Select a saved project to load");
+  const loadTemplate = () => {
+    const template = templateProjects.find((item) => item.name === selectedTemplateName);
+    if (!template) {
+      setStatus("Select a template to load");
       return;
     }
-    const nextTask = clampTask(Number(project.taskId?.replace("task", "")) || task);
-    const targetId = taskIdFor(nextTask);
     const entry = {
-      nodes: cloneGraph(project.nodes),
-      edges: cloneGraph(project.edges),
-      projectName: project.name,
+      nodes: cloneGraph(template.nodes),
+      edges: cloneGraph(template.edges),
+      projectName: template.name,
     };
-    stashGraphInMap(targetId, entry);
-    if (targetId === taskId) {
-      setProjectName(entry.projectName);
-      setNodes(cloneGraph(entry.nodes));
-      setEdges(cloneGraph(entry.edges));
-      resetTransientGraphState();
-      scheduleFitView();
-    } else {
-      setTask(nextTask);
-    }
-    setStatus(`Loaded project ${project.name} into ${targetId}`);
+    stashGraphInMap(taskId, entry);
+    setProjectName(entry.projectName);
+    setNodes(cloneGraph(entry.nodes));
+    setEdges(cloneGraph(entry.edges));
+    resetTransientGraphState();
+    scheduleFitView();
+    setStatus(`Loaded template ${template.name} into ${taskId}`);
   };
 
   const stashGraphInMap = (id, entry) => {
@@ -954,13 +974,23 @@ function App() {
         </section>
         <section>
           <h2>PROJECT</h2>
-          <input aria-label="Project name" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
-          <div className="twoCol"><button className="btn" onClick={newProject}>New</button><button className="btn" onClick={saveProject}><Save size={15} />Save All</button></div>
-          <button className="btn full" onClick={revertAllSaved}>Revert All to Saved</button>
-          <select aria-label="Saved project" value={selectedProjectName} onChange={(event) => setSelectedProjectName(event.target.value)}>
-            {availableProjects.map((item) => <option key={item.name} value={item.name}>{item.name}{item.source === "template" ? " (template)" : ""}</option>)}
+          <input aria-label="Save name" placeholder="Save name" value={saveName} onChange={(e) => setSaveName(e.target.value)} />
+          <button className="btn full" onClick={saveAll}><Save size={15} />Save All</button>
+          <select aria-label="Saved snapshot" value={selectedSaveName} onChange={(e) => setSelectedSaveName(e.target.value)}>
+            <option value="">{Object.keys(savedSnapshots).length ? "Select a save" : "No saves yet"}</option>
+            {Object.entries(savedSnapshots).sort((a, b) => a[0].localeCompare(b[0])).map(([name, entry]) => (
+              <option key={name} value={name}>{name} ({Object.keys(entry.graphsByTask || {}).length} task{Object.keys(entry.graphsByTask || {}).length === 1 ? "" : "s"})</option>
+            ))}
           </select>
-          <button className="btn full" onClick={loadProject} disabled={availableProjects.length === 0}>Load Selected (single task)</button>
+          <button className="btn full" onClick={loadSelected} disabled={!selectedSaveName || !savedSnapshots[selectedSaveName]}>Load Selected</button>
+        </section>
+        <section>
+          <h2>TEMPLATES</h2>
+          <select aria-label="Template" value={selectedTemplateName} onChange={(e) => setSelectedTemplateName(e.target.value)}>
+            <option value="">{templateProjects.length ? "Select a template" : "No templates"}</option>
+            {templateProjects.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+          </select>
+          <button className="btn full" onClick={loadTemplate} disabled={!selectedTemplateName}>Load Template into {taskId}</button>
         </section>
         <section>
           <h2>IMPORT ONNX</h2>
