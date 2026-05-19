@@ -1195,6 +1195,27 @@ def _arc_grid_to_canvas(value: Any) -> tuple[np.ndarray, tuple[int, int]]:
     return canvas, (height, width)
 
 
+def _arc_grid_to_one_hot_canvas(value: Any, channels: int) -> tuple[np.ndarray, tuple[int, int]]:
+    arr = np.asarray(value)
+    if arr.ndim != 2:
+        raise ValueError(f"expected a 2D ARC grid for one-hot encoding, got rank {arr.ndim}")
+    arr = arr.astype(np.int64)
+    height, width = arr.shape
+    if height > 30 or width > 30:
+        raise ValueError(f"ARC grid shape {[height, width]} exceeds 30x30 canvas")
+    canvas = np.zeros([1, channels, 30, 30], dtype=np.float32)
+    for c in range(min(channels, 10)):
+        canvas[0, c, :height, :width] = (arr == c).astype(np.float32)
+    return canvas, (height, width)
+
+
+def _decode_model_output(actual: np.ndarray) -> np.ndarray:
+    arr = np.asarray(actual)
+    if arr.ndim == 4 and arr.shape[1] > 1:
+        return np.argmax(arr, axis=1, keepdims=True).astype(np.float32)
+    return arr
+
+
 def _first_bad_index(actual: np.ndarray, expected: np.ndarray) -> list[int]:
     bad = np.argwhere(actual != expected)
     if bad.size == 0:
@@ -1223,12 +1244,21 @@ def _run_session(session: ort.InferenceSession, source_grid: Any) -> tuple[np.nd
     inputs = session.get_inputs()
     if not inputs:
         raise ValidationError("Phase 1 Strict Equivalence failed: compiled model has no inputs")
-    canvas, region = _arc_grid_to_canvas(source_grid)
     feed = {}
+    region: tuple[int, int] | None = None
     for input_meta in inputs:
-        if list(input_meta.shape) != CANVAS_SHAPE:
-            raise ValidationError(f"Model input {input_meta.name} has shape {input_meta.shape}, expected {CANVAS_SHAPE}")
+        shape = list(input_meta.shape)
+        if shape == CANVAS_SHAPE:
+            canvas, region = _arc_grid_to_canvas(source_grid)
+        elif len(shape) == 4 and shape[0] == 1 and shape[2] == 30 and shape[3] == 30:
+            canvas, region = _arc_grid_to_one_hot_canvas(source_grid, int(shape[1]))
+        else:
+            raise ValidationError(
+                f"Model input {input_meta.name} has shape {shape}, "
+                f"expected {CANVAS_SHAPE} or [1, channels, 30, 30]"
+            )
         feed[input_meta.name] = canvas
+    assert region is not None
     return session.run(None, feed)[0], region
 
 
@@ -1266,7 +1296,8 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
         if "input" not in pair or expected_key not in pair:
             raise ValidationError(f"Phase 1 Strict Equivalence failed: Train {index} is missing input or output grid")
         try:
-            actual, _input_region = _run_session(session, pair["input"])
+            raw_actual, _input_region = _run_session(session, pair["input"])
+            actual = _decode_model_output(raw_actual)
             expected_canvas, (height, width) = _arc_grid_to_canvas(pair[expected_key])
         except ValidationError:
             raise
@@ -1286,8 +1317,8 @@ def validate_model(model: onnx.ModelProto, payload: ExportPayload) -> dict[str, 
 
     for index, pair in enumerate(payload.trainingPairs, start=1):
         try:
-            actual, _region = _run_session(session, pair["input"])
-            canvas_outputs.append(actual)
+            raw_actual, _region = _run_session(session, pair["input"])
+            canvas_outputs.append(_decode_model_output(raw_actual))
         except Exception as exc:
             raise ValidationError(f"Phase 2 Canvas Test failed: Train {index} 30x30 canvas runtime error: {exc}") from exc
 

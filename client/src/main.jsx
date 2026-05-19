@@ -606,8 +606,13 @@ function App() {
       const parts = [`${saved.length} saved`];
       if (rejected.length) parts.push(`${rejected.length} rejected`);
       setStatus(`Import: ${parts.join(", ")}`);
-      if (saved.includes(taskId)) {
-        await applyGraphFromBest(taskId);
+      if (saved.length > 0) {
+        const target = saved.includes(taskId) ? taskId : saved[0];
+        const targetNumber = Number(target.replace("task", ""));
+        if (Number.isFinite(targetNumber) && target !== taskId) {
+          setTask(clampTask(targetNumber));
+        }
+        await applyGraphFromBest(target);
       }
     } catch (error) {
       const reason = error.response?.data?.reason || error.message;
