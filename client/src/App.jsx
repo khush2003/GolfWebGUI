@@ -721,12 +721,6 @@ export default function App() {
     appendLog("warn", "loader", `Deleted workspace`);
   }, [appendLog]);
 
-  const openBottomTab = useCallback((t) => {
-    if (bottomCollapsed) { setBottomCollapsed(false); setBottomTab(t); }
-    else if (bottomTab === t) setBottomCollapsed(true);
-    else setBottomTab(t);
-  }, [bottomCollapsed, bottomTab]);
-
   useEffect(() => {
     const onKey = (e) => {
       const cmd = e.metaKey || e.ctrlKey;
@@ -937,10 +931,9 @@ export default function App() {
           )}
 
           <StatusBar
-            taskId={taskId} graph={graph} validation={validation}
-            bottomTab={bottomTab} bottomCollapsed={bottomCollapsed}
+            taskId={taskId} graph={graph}
+            bottomCollapsed={bottomCollapsed}
             onToggleBottom={() => setBottomCollapsed((c) => !c)}
-            onOpenTab={openBottomTab}
             inspectorOpen={inspectorOpen}
             onToggleInspector={() => setInspectorOpen((o) => !o)}
             selectedNode={selectedNode}

@@ -121,8 +121,7 @@ export const TopBar = ({
         <span>{dirty ? "Unsaved" : "Saved"}</span>
       </div>
 
-      <Button variant="ghost" icon="save" onClick={onSave} title="Save current task (⌘S)">Save</Button>
-      <Button variant="ghost" icon="save" onClick={onSaveAll} title="Save all tasks in workspace (⌘⇧S)">Save All</Button>
+      <Button variant="ghost" icon="save" onClick={onSave} title="Save current task (⌘S · ⌘⇧S = save all)">Save</Button>
       <Button variant="ghost" icon="upload" onClick={onImport}>Import</Button>
       <Button variant="ghost" icon="download" onClick={onExport}>Export</Button>
       {onExportZip && (
@@ -135,7 +134,6 @@ export const TopBar = ({
           Submission · {submissionCount || 0}
         </Button>
       )}
-      <Button variant="ghost" icon="zap" onClick={onCompile} title="Compile only">Compile</Button>
 
       <div style={{ width: 1, height: 20, background: "var(--border)" }} />
 
@@ -738,7 +736,7 @@ const fmtNumShort = (n) => {
 };
 
 export const StatusBar = ({
-  taskId, graph, validation, bottomTab, bottomCollapsed, onToggleBottom, onOpenTab,
+  taskId, graph, bottomCollapsed, onToggleBottom,
   inspectorOpen, onToggleInspector, selectedNode, fullscreen, onToggleFullscreen,
   suggestionCount, onOpenSimplifier, status,
   efficiency, efficiencyError, efficiencyRefreshing, bestByTask,
@@ -809,14 +807,8 @@ export const StatusBar = ({
         {selectedNode.type} <span style={{ color: "var(--text-dim)" }}>{selectedNode.id}</span>
       </span>
     )}
-    <button onClick={() => onOpenTab("logs")} style={statusBtn(bottomTab === "logs" && !bottomCollapsed)}>
-      <Icon name="terminal" size={11} /> Logs
-    </button>
-    <button onClick={() => onOpenTab("validation")} style={statusBtn(bottomTab === "validation" && !bottomCollapsed)}>
-      <Icon name="target" size={11} /> Validation
-    </button>
-    <button onClick={onToggleBottom} style={statusBtn(!bottomCollapsed, true)} title="Toggle panel (⌘J)">
-      <Icon name={bottomCollapsed ? "chevronUp" : "chevronDown"} size={11} />
+    <button onClick={onToggleBottom} style={statusBtn(!bottomCollapsed)} title="Toggle bottom panel (⌘J)">
+      <Icon name={bottomCollapsed ? "chevronUp" : "chevronDown"} size={11} /> Panel
     </button>
     <div style={{ width: 1, height: 14, background: "var(--border)", margin: "0 2px" }} />
     <button onClick={onToggleInspector} style={statusBtn(inspectorOpen)}>
